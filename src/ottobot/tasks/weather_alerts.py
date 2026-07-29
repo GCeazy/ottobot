@@ -1,35 +1,32 @@
-"""Poll Environment Canada's weather alert feed for Ottawa.
+"""Poll Environment Canada's weather alerts API for Ottawa.
 
-Environment Canada publishes an Atom "battleboard" feed of currently
-active weather alerts (warnings, watches, statements) per region. Every 10
-minutes the feed is fetched and any alert not seen on a previous fetch is
-announced, one message per new alert. The very first
-fetch only records what's already active — it
+Environment Canada's modern alerts API
+(``api.weather.gc.ca/collections/weather-alerts``) publishes every active
+weather alert (warnings, watches, statements) as GeoJSON. We query it
+filtered to an Ottawa ``bbox``; every 10 minutes the collection is fetched
+and any alert not seen on a previous fetch is announced, one message per
+new alert. The very first fetch only records what's already active — it
 doesn't announce ongoing alerts the bot just happened to start during — so
 only newly issued alerts are ever announced. Alerts go out on the
 "#ott-alerts" channel, one of the configured channels (ottobot.channels).
 
-The feed represents "no alerts" as a real <entry> ("No alerts in effect,
-..."), so the bot announces an all-clear once when the last alert ends.
-That entry's <id> embeds the feed's update timestamp, so this relies on
-Environment Canada only bumping the timestamp when the battleboard
-actually changes. If the all-clear ever starts repeating, dedupe it by
-title instead of id (announce it only when the previous announcement
-wasn't already an all-clear).
-
-To be nice to Environment Canada's servers, fetches are conditional: the
-ETag/Last-Modified validators from the last successful fetch are sent back
-as If-None-Match/If-Modified-Since, so an unchanged feed costs a single
-304 with no body. The validators live in memory only (no disk writes); a
-restart just means one unconditional fetch to re-prime them.
+The bbox query returns one GeoJSON Feature per polygon of an alert that
+intersects Ottawa, so a single alert spanning several polygons shows up as
+several Features that share one weather bulletin. They're deduped on the
+bulletin id (see ``alert_key``), and then on the announced text, since one
+weather event reaches Ottawa as several bulletins — one per region, e.g. an
+Ontario-side and a Gatineau special weather statement carrying the same
+headline. Alerts that have ended linger in the collection for hours and
+are ignored (see ``ENDED``), so when the last alert ends the collection
+reads as empty and the bot announces an all-clear once (guarded by
+``_seen`` so it can't repeat).
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from datetime import timedelta
-from xml.etree import ElementTree
+from typing import Any, NamedTuple
 
 import httpx
 
@@ -38,71 +35,146 @@ from ottobot.channels import OTT_ALERTS
 
 logger = logging.getLogger(__name__)
 
-ALERTS_URL = "https://weather.gc.ca/rss/battleboard/onrm104_e.xml"
+ALERTS_URL = "https://api.weather.gc.ca/collections/weather-alerts/items"
 
-_ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+# The Ottawa region. bbox is min-lon,min-lat,max-lon,max-lat; limit is set
+# well above the handful of alert polygons Ottawa ever sees at once so a
+# real alert can't be truncated off the end of the collection (the API
+# default is only 10). skipGeometry drops the alert polygons and
+# `properties` restricts the response to the fields we read — without them
+# each Feature also carries its full boundary polygon and the French half
+# of every bulletin, a multiple of the payload we'd only throw away.
+_PARAMS = {
+    "bbox": "-76.1,45.15,-75.4,45.55",
+    "f": "json",
+    "limit": 100,
+    "skipGeometry": "true",
+    "properties": (
+        "id,feature_id,alert_name_en,alert_code,publication_datetime,"
+        "alert_text_en,status_en"
+    ),
+}
 
-# Every entry title in the regional feed ends with the region name; drop it
-# to save mesh bandwidth.
-_TITLE_SUFFIX = ", Ottawa North - Kanata - Orléans"
+# An alert that's over stays in the collection until its expiration
+# datetime, up to about a day later, carrying status_en "ended" (the live
+# values are "issued", "continued" and "ended"). Those are dropped: nothing
+# is announced for weather that's already past, and the collection reads as
+# empty as soon as the last real alert ends, so the all-clear goes out then
+# rather than a day late.
+ENDED = "ended"
 
-# The battleboard packs active alerts into numbered slots (onrm104_w1,
-# onrm104_w2, …) ordered newest-first, and an entry's <id> embeds its slot.
-# So when a new alert is issued the older ones shift down a slot and their
-# ids change — a reshuffle that must not look like a brand-new alert.
-_SLOT_RE = re.compile(r"_w\d+(?=:)")
+# MeshCore truncates a channel message past ~140 UTF-8 bytes, so an alert
+# only carries its headline when the two together stay under that.
+MAX_MESSAGE_LEN = 140
 
-# Stable, slot-independent keys of alerts already announced or seen on the
-# priming run.
+# Announced once when the last active alert clears: the empty collection
+# carries no entry to announce, so the message is synthesized here.
+ALL_CLEAR = "No alerts in effect"
+
+# Announcements already made or seen on the priming run, held as the text
+# announced rather than the bulletin id: an alert re-issued per region
+# arrives as several bulletins carrying one message, and the channel should
+# see that message once.
 _seen: set[str] = set()
 _primed = False
 
-# Cache validators from the last successfully parsed fetch, kept in memory
-# only. Either may be None if the server didn't send it.
-_etag: str | None = None
-_last_modified: str | None = None
+
+class Alert(NamedTuple):
+    key: str  # stable per-alert key (the bulletin id), for polygon dedup
+    title: str  # human text announced on the channel
+    published: str  # publication_datetime, for oldest-first ordering
 
 
-def normalize_etag(etag: str) -> str:
-    """Strip Apache mod_deflate's "-gzip" ETag suffix.
+def alert_key(alert_id: str, feature_id: str | None) -> str:
+    """The stable per-alert id, independent of which polygon carried it.
 
-    Apache tags compressed responses with `W/"...-gzip"` but only matches
-    If-None-Match against the uncompressed form, so sending the suffixed
-    value back gets a full 200 every time. The stripped form matches
-    (verified against weather.gc.ca).
+    The bbox query returns one Feature per polygon of an alert that
+    intersects Ottawa, all sharing a single weather bulletin but each with
+    its own ``feature_id`` appended to the Feature ``id`` (e.g.
+    ``<bulletin>_fea1-2370``). Stripping that suffix leaves the bulletin
+    id, which is identical across every polygon of the same alert, so an
+    alert spanning several polygons is announced once. A re-issued alert
+    gets a fresh bulletin id and so is announced again.
     """
-    if etag.endswith('-gzip"'):
-        return etag[: -len('-gzip"')] + '"'
-    return etag
+    if feature_id:
+        return alert_id.removesuffix("_" + feature_id)
+    return alert_id
 
 
-def alert_key(alert_id: str) -> str:
-    """Identify an alert independently of the feed slot it currently occupies.
+def headline(alert_text: str) -> str:
+    """The one-line summary an alert bulletin opens with, if it has one.
 
-    Dropping the `_wN` slot marker leaves the region and issue timestamp,
-    which stay put when other alerts come and go — so an ongoing alert that
-    merely shifted slots isn't mistaken for a new one. A genuine re-issue
-    changes the timestamp and so is still announced again. The "no alerts"
-    all-clear entry has no slot marker and is returned unchanged.
+    ``alert_text_en`` is the full bulletin: usually a plain-language
+    headline paragraph ("Heavy rainfall possible through Wednesday
+    morning.") followed by labelled sections — "What:", "When:",
+    "Additional information:". Some bulletins open straight at a label, and
+    then the first line under it is the closest thing to a summary.
     """
-    return _SLOT_RE.sub("", alert_id)
+    lines = [line.strip() for line in alert_text.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    if not lines[0].endswith(":"):
+        return lines[0]
+    return lines[1] if len(lines) > 1 else ""
 
 
-def parse_alerts(xml_text: str) -> list[tuple[str, str]]:
-    """Return (id, title) for each <entry> in the alerts feed, document order."""
-    root = ElementTree.fromstring(xml_text)
-    alerts = []
-    for entry in root.findall("atom:entry", _ATOM_NS):
-        title = (
-            entry.findtext("atom:title", default="", namespaces=_ATOM_NS) or ""
-        ).strip()
-        title = title.removesuffix(_TITLE_SUFFIX)
-        alert_id = (
-            entry.findtext("atom:id", default="", namespaces=_ATOM_NS) or ""
-        ).strip()
-        if alert_id:
-            alerts.append((alert_id, title or alert_id))
-    return alerts
+def _title(props: dict[str, Any], key: str) -> str:
+    """The text announced for an alert, e.g. "Air Quality Warning".
+
+    The alert name alone is often the whole story ("Tornado Warning"), but
+    a name like "Special Weather Statement" says nothing about the weather,
+    so Environment Canada's own headline is appended when the bulletin
+    carries one — as long as the result still fits a packet. The headlines
+    that don't fit are the long boilerplate ones ("Conditions are
+    favourable for the development of severe thunderstorms that…"), whose
+    clipped half is worth less on the channel than the bare name.
+    """
+    name = (props.get("alert_name_en") or "").strip()
+    title = name.title() if name else (props.get("alert_code") or key)
+    summary = headline(props.get("alert_text_en") or "")
+    if not summary:
+        return title
+    with_summary = f"{title}: {summary}"
+    if len(with_summary.encode("utf-8")) > MAX_MESSAGE_LEN:
+        return title
+    return with_summary
+
+
+def parse_alerts(payload: dict[str, Any]) -> list[Alert]:
+    """Return one Alert per distinct announcement in effect, oldest-first.
+
+    Alerts that have ended are dropped. What's left collapses twice: first
+    on the bulletin id, so the several polygons of one alert become one
+    Alert, then on the announced text, so the per-region bulletins of one
+    weather event become one message rather than several identical ones.
+    The result is ordered by publication time so several alerts found in
+    one fetch are announced oldest-first.
+    """
+    by_key: dict[str, Alert] = {}
+    for feature in payload.get("features") or []:
+        props = feature.get("properties") or {}
+        alert_id = (props.get("id") or "").strip()
+        if not alert_id or props.get("status_en") == ENDED:
+            continue
+        key = alert_key(alert_id, props.get("feature_id"))
+        by_key.setdefault(
+            key,
+            Alert(key, _title(props, key), props.get("publication_datetime") or ""),
+        )
+    by_title: dict[str, Alert] = {}
+    for alert in sorted(by_key.values(), key=lambda a: (a.published, a.key)):
+        by_title.setdefault(alert.title, alert)
+    return list(by_title.values())
+
+
+async def fetch_alerts() -> list[Alert]:
+    """Fetch the live Ottawa collection and parse it into announcements."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(ALERTS_URL, params=_PARAMS)
+        response.raise_for_status()
+        payload = response.json()
+    return parse_alerts(payload)
 
 
 @task(
@@ -112,40 +184,31 @@ def parse_alerts(xml_text: str) -> list[tuple[str, str]]:
     help="Announce new Environment Canada weather alerts for Ottawa",
 )
 async def weather_alerts(ctx: TaskContext) -> None:
-    global _primed, _etag, _last_modified
-    headers = {}
-    if _etag is not None:
-        headers["If-None-Match"] = _etag
-    if _last_modified is not None:
-        headers["If-Modified-Since"] = _last_modified
+    global _primed
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(ALERTS_URL, headers=headers)
-            if response.status_code == 304:
-                return
-            response.raise_for_status()
-        alerts = parse_alerts(response.text)
-        # Only keep validators for a feed we actually parsed, so a bad
-        # document can't get stuck behind 304s.
-        etag = response.headers.get("ETag")
-        _etag = normalize_etag(etag) if etag is not None else None
-        _last_modified = response.headers.get("Last-Modified")
+        alerts = await fetch_alerts()
     except Exception:
         logger.warning("failed to fetch Environment Canada alerts", exc_info=True)
         return
 
+    logger.info(f"alerts from feed {alerts}")
+
     if not _primed:
-        _seen.update(alert_key(alert_id) for alert_id, _ in alerts)
+        _seen.update(alert.title for alert in alerts)
         _primed = True
         return
 
-    new_alerts = [pair for pair in alerts if alert_key(pair[0]) not in _seen]
-    _seen.update(alert_key(alert_id) for alert_id, _ in new_alerts)
-    # Several alerts can be published in a single fetch; announce each on its
-    # own line/packet, oldest-first (the feed lists newest first).
-    await ctx.reply_many(title for _, title in reversed(new_alerts))
-    # Drop keys that have left the feed so _seen doesn't grow forever on a
-    # long-running bot. Keys embed their issue timestamp, so an ended
-    # alert's key doesn't come back; a genuinely re-issued alert gets a
-    # fresh key and is announced again.
-    _seen.intersection_update(alert_key(alert_id) for alert_id, _ in alerts)
+    new_alerts = [alert for alert in alerts if alert.title not in _seen]
+    # Several alerts can appear in one fetch; announce each on its own
+    # line/packet, oldest-first (parse_alerts already orders them).
+    await ctx.reply_many(alert.title for alert in new_alerts)
+    # The collection just went empty after having alerts: sound the
+    # all-clear once. The _seen guard (cleared below) keeps it from
+    # repeating on subsequent empty fetches.
+    if not alerts and _seen:
+        await ctx.reply(ALL_CLEAR)
+    # Track only the live collection so _seen doesn't grow forever on a
+    # long-running bot. An ended alert's text doesn't come back; a re-issued
+    # alert saying something new is announced again.
+    _seen.clear()
+    _seen.update(alert.title for alert in alerts)
