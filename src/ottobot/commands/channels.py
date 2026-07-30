@@ -16,6 +16,11 @@ CHANNELS = (
     "#aircraft",
     "#watersports",
     "#ott-alerts",
+    "#radio",
+    "#queer",
+    "#caf",
+    "#wardriving",
+    "#cars",
 )
 
 
