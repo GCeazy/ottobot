@@ -10,26 +10,60 @@ URL = "https://weather.gc.ca/en/location/index.html?coords=45.403,-75.687"
 
 
 def summarize_forecast_text(text: str) -> str:
-    """Compresses a detailed forecast block into a concise sentence + High/Low."""
-    # Strip leading temperature prefixes if present (e.g. "18° C.")
+    """Compresses a detailed forecast block using heavy abbreviation for mesh limits."""
+    # Strip leading temperature prefixes and trailing UV index sentences
     clean = re.sub(r"^-?\d+°?\sC\.?\s", "", text).strip()
+    clean = re.sub(r"UV index.*?(\.|$)", "", clean, flags=re.IGNORECASE)
 
-    # Abbreviate common long phrases to save space on mesh
-    clean = clean.replace("percent chance", "% chance")
+    # Bond temperatures tightly (e.g. "High 25" -> "H:25")
+    clean = re.sub(r"\bHigh\s+(-?\d+)", r"H:\1", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\bLow\s+(-?\d+)", r"L:\1", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\bHumidex\s+(\d+)", r"Hx:\1", clean, flags=re.IGNORECASE)
 
-    # Extract just the first core sentence
-    sentences = [s.strip() for s in clean.split(".") if s.strip()]
-    if not sentences:
-        return clean
+    # Condense probability swings (e.g., 30->70% shwrs)
+    clean = re.sub(
+        r"(\d+)\spercent chance of showers changing to (\d+)\spercent chance of showers",
+        r"\1->\2% shwrs",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    clean = re.sub(
+        r"(\d+)\s*percent chance of showers", r"\1% shwrs", clean, flags=re.IGNORECASE
+    )
+    clean = re.sub(r"(\d+)\s*percent chance", r"\1%", clean, flags=re.IGNORECASE)
 
-    first_sentence = sentences[0]
+    # General word compression mapping - updated for better readability
+    abbr_map = {
+        r"\bchanging to\b": "->",
+        r"\bbecoming\b": "->",
+        r"\bRisk of a thunderstorm\b": "Risk T-storm",
+        r"\bMainly cloudy\b": "Mnly Cldy",
+        r"\bPartly cloudy\b": "Ptly Cldy",
+        r"\bMostly cloudy\b": "Mstly Cldy",
+        r"\bA mix of sun and cloud\b": "Sun/Cld Mix",
+        r"\bkm/h\b": "kph",
+        r"\bgusting to\b": "gust",
+        r"\bLocal amount\b": "Amt",
+        # Drop redundant time-of-day phrases to save space
+        r"\bthis afternoon\b": "",
+        r"\bearly this evening\b": "",
+        r"\bthis evening\b": "",
+        r"\bnear noon\b": "",
+        r"\bthis morning\b": "",
+    }
 
-    # Grab the High or Low temperature from anywhere in the text block
-    temp_match = re.search(r"\b(High|Low)\s+(-?\d+)", clean, re.IGNORECASE)
-    if temp_match and temp_match.group(0).lower() not in first_sentence.lower():
-        return f"{first_sentence}. {temp_match.group(1)} {temp_match.group(2)}"
+    for k, v in abbr_map.items():
+        clean = re.sub(k, v, clean, flags=re.IGNORECASE)
 
-    return first_sentence
+    # Replace periods separating sentences with commas to condense text
+    clean = re.sub(r"\.\s*", ", ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    # Clean up commas around removed words (e.g., ", , " or trailing commas)
+    clean = re.sub(r",\s*,", ",", clean)
+    clean = re.sub(r"[, ]+$", "", clean)
+
+    return clean
 
 
 def fetch_forecast_datamart() -> str:
@@ -46,7 +80,6 @@ def fetch_forecast_datamart() -> str:
         text = re.sub(r"\s+", " ", text)
         text = text.replace("&deg;", "°")
 
-        # Focus strictly on the "Detailed Forecast" block at the bottom of the page
         if "Detailed Forecast" in text:
             target_text = text.split("Detailed Forecast")[-1]
         else:
@@ -77,7 +110,8 @@ def fetch_forecast_datamart() -> str:
             p2_text_raw = target_text[matches[1].end() : p2_end_match].strip()
             p2_summary = summarize_forecast_text(p2_text_raw)
 
-            return f"{p1_name}: {p1_summary} | {p2_name}: {p2_summary}"
+            # Apply the requested formatting
+            return f"{p1_name} > {p1_summary} | {p2_name} > {p2_summary}"
 
         return "Could not extract forecast text."
 
@@ -92,7 +126,7 @@ async def forecast(ctx: Context) -> str:
 
     try:
         forecast_text = await asyncio.to_thread(fetch_forecast_datamart)
-        msg = f"@[{who}] YOW: {forecast_text}"
+        msg = f"@[{who}] YOW FCST: {forecast_text}"
 
     except Exception:
         msg = f"@[{who}] Error fetching YOW forecast."
