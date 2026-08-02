@@ -1,3 +1,12 @@
+# ==============================================================================
+# VERSION: 0.2.0
+# LINES CHANGED: Forecast text replacement block updated
+# CHANGELOG:
+# - Incremented minor version to 0.2.0.
+# - Added new space-saving weather abbreviations to prevent hitting channel character limits:
+#   'before' -> 'b4', 'heavy' -> 'hvy', 'evening' -> 'eve', 'morning' -> 'morn', 'beginning' -> 'start'.
+# ==============================================================================
+
 """!forecast — check the short-term weather forecast for Ottawa (YOW)."""
 
 import urllib.request
@@ -15,6 +24,9 @@ def summarize_forecast_text(text: str) -> str:
     clean = re.sub(r"^-?\d+°?\s*C\.?\s*", "", text).strip()
     clean = re.sub(r"UV index.*?(\.|$)", "", clean, flags=re.IGNORECASE)
 
+    # Strip wind details to save ~30 characters per period for mesh radio limits
+    clean = re.sub(r",?\s*Wind\s+[^,.]*", "", clean, flags=re.IGNORECASE)
+
     # Bond temperatures tightly (e.g. "High 25" -> "H:25")
     clean = re.sub(r"\bHigh\s+(-?\d+)", r"H:\1", clean, flags=re.IGNORECASE)
     clean = re.sub(r"\bLow\s+(-?\d+)", r"L:\1", clean, flags=re.IGNORECASE)
@@ -23,65 +35,83 @@ def summarize_forecast_text(text: str) -> str:
     # Condense probability swings (e.g., 30->70% shwrs)
     clean = re.sub(
         r"(\d+)\s*percent chance of showers changing to (\d+)\s*percent chance of showers",
-        r"\1->\2% shwrs",
+        r"\1->\2% shwr",
         clean,
         flags=re.IGNORECASE,
     )
     clean = re.sub(
-        r"(\d+)\s*percent chance of showers", r"\1% shwrs", clean, flags=re.IGNORECASE
+        r"(\d+)\s*percent chance of showers", r"\1% shwr", clean, flags=re.IGNORECASE
     )
     clean = re.sub(r"(\d+)\s*percent chance", r"\1%", clean, flags=re.IGNORECASE)
 
-    # General word compression mapping - updated with new abbreviations
+    # Ultra-aggressive mesh radio compression mapping
     abbr_map = {
         r"\bchanging to\b": "->",
         r"\bbecoming\b": "->",
-        r"\bRisk of a thunderstorm\b": "Risk TStorm",
-        r"\bMainly cloudy\b": "Mnly Cldy",
-        r"\bPartly cloudy\b": "Ptly Cldy",
-        r"\bMostly cloudy\b": "Mstly Cldy",
-        r"\bA mix of sun and cloud\b": "Sun/Cld Mix",
+        r"\bRisk of a thunderstorm\b": "Rsk TStorm",
+        r"\bRisk of thunderstorms\b": "Rsk TStorm",
+        r"\bthunderstorm\b": "TStorm",
+        r"\bthunderstorms\b": "TStorms",
+        r"\bFog patches\b": "Fog",
+        r"\bdeveloping after midnight\b": "late",
+        r"\bdeveloping\b": "dev",
+        r"\bovernight\b": "ovrnite",
+        r"\bMainly cloudy\b": "M.Cldy",
+        r"\bPartly cloudy\b": "P.Cldy",
+        r"\bMostly cloudy\b": "M.Cldy",
+        r"\bA mix of sun and cloud\b": "Sun/Cld",
+        r"\bClearing\b": "Clrng",
         r"\bkm/h\b": "kph",
         r"\bgusting to\b": "gust",
         r"\bLocal amount\b": "Amt",
+        r"\bshowers\b": "shwr",
         r"\bwith\b": "w/",
         r"\band\b": "&",
-        # Drop redundant time-of-day phrases to save space
+        r"\bbefore\b": "b4",
+        r"\bheavy\b": "hvy",
+        r"\bbeginning\b": "start",
+        # Aggressive whitespace and phrase shedding specifically for mesh limits
+        r"\blate in the morning\b": "",
+        r"\bdissipating in the morning\b": "",
+        r"\bearly in the morning\b": "",
+        r"\bin the morning\b": "",
+        r"\bin the afternoon\b": "",
+        r"\bdissipating\b": "diss",
         r"\bthis afternoon\b": "",
         r"\bearly this evening\b": "",
         r"\bthis evening\b": "",
         r"\bnear noon\b": "",
         r"\bthis morning\b": "",
+        # Placed at the end so phrase shedding captures multi-word phrases first
+        r"\bevening\b": "eve",
+        r"\bmorning\b": "morn",
     }
 
     for k, v in abbr_map.items():
         clean = re.sub(k, v, clean, flags=re.IGNORECASE)
 
-    # Replace periods separating sentences with commas to condense text
-    clean = re.sub(r"\.\s*", ", ", clean)
+    # Condense punctuation entirely (removes spaces after commas)
+    clean = re.sub(r"\.\s*", ",", clean)
     clean = re.sub(r"\s+", " ", clean).strip()
-    clean = re.sub(r"\s+,", ",", clean)
+    clean = re.sub(r"\s*,", ",", clean)
+    clean = re.sub(r",\s+", ",", clean)
 
     # --- TEMPERATURE PRIORITY LOGIC ---
-    # Extract the temperatures so we can move them to the front of the string
     temps = []
     for prefix in [r"H:", r"L:", r"Hx:"]:
         match = re.search(rf"{prefix}-?\d+", clean)
         if match:
             temps.append(match.group(0))
-            # Remove the temp from its original location
             clean = re.sub(rf"{prefix}-?\d+", "", clean)
 
-    # Clean up orphan commas left behind by removing the temperatures
-    clean = re.sub(r",\s*,", ",", clean)
+    clean = re.sub(r",+", ",", clean)
     clean = re.sub(r"[, ]+$", "", clean)
     clean = clean.strip(", ")
 
-    # Re-attach temperatures at the very front of the summary
     if temps:
-        temp_str = ", ".join(temps)
+        temp_str = ",".join(temps)
         if clean:
-            clean = f"{temp_str}, {clean}"
+            clean = f"{temp_str},{clean}"
         else:
             clean = temp_str
 
@@ -116,13 +146,15 @@ def fetch_forecast_datamart() -> str:
 
         if len(matches) >= 2:
             # --- Period 1 (Tonight/Today) ---
-            p1_name = matches[0].group(1).strip()
+            p1_raw = matches[0].group(1).strip()
+            p1_name = "Tonight" if p1_raw == "Tonight" else p1_raw.split()[0]
+
             p1_text_raw = target_text[matches[0].end() : matches[1].start()].strip()
             p1_summary = summarize_forecast_text(p1_text_raw)
 
             # --- Period 2 (Tomorrow Daytime) ---
             p2_raw = matches[1].group(1).strip()
-            p2_name = p2_raw.split()[0]  # Shortens "Thu , 30 Jul" down to "Thu"
+            p2_name = "Tonight" if p2_raw == "Tonight" else p2_raw.split()[0]
 
             p2_end_match = matches[2].start() if len(matches) > 2 else len(target_text)
             night_match = night_pattern.search(target_text, matches[1].end())
@@ -132,7 +164,7 @@ def fetch_forecast_datamart() -> str:
             p2_text_raw = target_text[matches[1].end() : p2_end_match].strip()
             p2_summary = summarize_forecast_text(p2_text_raw)
 
-            return f"{p1_name} > {p1_summary} | {p2_name} > {p2_summary}"
+            return f"{p1_name}>{p1_summary}|{p2_name}>{p2_summary}"
 
         return "Could not extract forecast text."
 
