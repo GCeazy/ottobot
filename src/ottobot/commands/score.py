@@ -1,11 +1,11 @@
 # ==============================================================================
-# VERSION: 0.4.4
-# LINES CHANGED: ~20 lines modified
+# VERSION: 0.5.21
+# LINES CHANGED: ~15 lines modified
 # CHANGELOG:
-# - Incremented patch version to 0.4.4.
-# - Added `typing.TypedDict` to explicitly define the `CFLEvent` structure.
-# - This resolves strict type-checking diagnostics where Pyright/MyPy panics
-#   over mixed types (str, int, datetime) inside the dynamically generated dictionary.
+# - Incremented patch version to 0.5.21.
+# - Simplified prefix logic in `fetch_city_slate` to cleanly output `YOW: ` or
+#   `Toronto: ` on default queries, removing the confusing `Today:` and `Sports:`
+#   labels while retaining the 7-day lookup functionality.
 # ==============================================================================
 
 """!score — get live sports scores and game slates via real-time APIs."""
@@ -15,7 +15,8 @@ import urllib.parse
 import json
 import asyncio
 import gzip
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, date
 from typing import TypedDict
 from ottobot import Context, command
 
@@ -34,6 +35,21 @@ class CFLEvent(TypedDict):
     dt: datetime
 
 
+class HockeyTechEvent(TypedDict):
+    game_date: date
+    month: int
+    day: int
+    time_str: str
+    away: str
+    home: str
+    away_name: str
+    home_name: str
+    away_score: str
+    home_score: str
+    status: str
+    dt: datetime
+
+
 # League Router Map
 LEAGUE_MAP = {
     # ESPN Standard Leagues
@@ -46,34 +62,69 @@ LEAGUE_MAP = {
     "mls": ("espn", "soccer", "usa.1", "MLS"),
     "epl": ("espn", "soccer", "eng.1", "EPL"),
     "laliga": ("espn", "soccer", "esp.1", "La Liga"),
+    "la liga": ("espn", "soccer", "esp.1", "La Liga"),
     "bundesliga": ("espn", "soccer", "ger.1", "Bundesliga"),
+    # Combat Sports
+    "ufc": ("ufc", "mma", "ufc", "UFC"),
+    "mma": ("ufc", "mma", "ufc", "UFC"),
     # Custom Dynamic JSON Fetcher
     "cfl": ("ha_cfl", "cfl", "CFL"),
-    # Paused Minor Leagues
-    "ohl": ("disabled", "", "OHL"),
+    # HockeyTech (LeagueStat) Feeds
+    "ohl": ("hockeytech", "ohl", "OHL"),
+    "chl": (
+        "hockeytech",
+        "ohl",
+        "OHL",
+    ),  # Defaulting generic CHL queries to OHL feed for local teams
+    "whl": ("hockeytech", "whl", "WHL"),
+    "qmjhl": ("hockeytech", "qmjhl", "QMJHL"),
+    # Paused Minor Leagues (No open APIs available)
     "cebl": ("disabled", "", "CEBL"),
     "cpl": ("disabled", "", "CPL"),
     "nll": ("disabled", "", "NLL"),
 }
 
-VALID_LEAGUES = sorted(list(LEAGUE_MAP.keys()) + ["f1"])
+HELP_LEAGUES = "Bundesliga, CFL, CHL, EPL, F1, La Liga, MLB, MLS, NBA, NFL, NHL, OHL, PWHL, QMJHL, UFC, WHL, WNBA"
 
 # Ambiguous triggers
 AMBIGUOUS_MAP = {
     "giants": "Try using: ny giants or sf giants",
     "jets": "Try using: ny jets or nhl jets",
-    "rangers": "Try using: nhl rangers or texas (rangers)",
+    "rangers": "Try using: nhl rangers, texas (rangers), or kitchener (rangers)",
     "kings": "Try using: nba kings or nhl kings",
     "cardinals": "Try using: nfl cardinals or stl cardinals",
     "atletico": "Try using: atletico madrid or atletico ottawa",
     "lions": "Try using: bc lions or detroit lions",
 }
 
+# Priority team sorting rules for league-wide queries
+PRIORITY_TEAMS = {
+    "mlb": [["tor", "blue jays", "jays"]],
+    "nhl": [
+        ["ott", "senators", "sens"],
+        ["mtl", "canadiens", "habs"],
+        ["tor", "maple leafs", "leafs"],
+    ],
+    "nba": [["tor", "raptors", "raps"]],
+    "nfl": [["buf", "bills"]],
+    "ohl": [["ott", "ottawa", "67s"]],
+    "pwhl": [
+        ["ott", "ottawa", "charge"],
+        ["mtl", "montreal", "victoire"],
+        ["tor", "toronto", "sceptres"],
+    ],
+    "wnba": [["tor", "toronto", "tempo"]],
+}
+
+ENG_SOCCER_SLUGS = "eng.1,eng.2,eng.3,eng.4,eng.fa,eng.league_cup"
+ESP_SOCCER_SLUGS = "esp.1,esp.2,esp.copa_del_rey,esp.super_cup"
+
 # Team Router Map
 TEAM_MAP = {
     # === BASEBALL (MLB) ===
     "jays": ("espn", "baseball", "mlb", "Blue Jays", "MLB"),
     "blue jays": ("espn", "baseball", "mlb", "Blue Jays", "MLB"),
+    "toronto blue jays": ("espn", "baseball", "mlb", "Blue Jays", "MLB"),
     "orioles": ("espn", "baseball", "mlb", "Orioles", "MLB"),
     "os": ("espn", "baseball", "mlb", "Orioles", "MLB"),
     "baltimore": ("espn", "baseball", "mlb", "Orioles", "MLB"),
@@ -206,7 +257,7 @@ TEAM_MAP = {
     "nets": ("espn", "basketball", "nba", "Nets", "NBA"),
     "knicks": ("espn", "basketball", "nba", "Knicks", "NBA"),
     "76ers": ("espn", "basketball", "nba", "76ers", "NBA"),
-    "sixers": ("espn", "basketball", "nba", "76ers", "NBA"),
+    "sixers": ("espn", "basketball", "nba", "Sixers", "NBA"),
     "bulls": ("espn", "basketball", "nba", "Bulls", "NBA"),
     "cavaliers": ("espn", "basketball", "nba", "Cavaliers", "NBA"),
     "cavs": ("espn", "basketball", "nba", "Cavaliers", "NBA"),
@@ -314,45 +365,93 @@ TEAM_MAP = {
     "portland timbers": ("espn", "soccer", "usa.1", "Timbers", "MLS"),
     "crew": ("espn", "soccer", "usa.1", "Crew", "MLS"),
     "columbus crew": ("espn", "soccer", "usa.1", "Crew", "MLS"),
-    # === SOCCER (EPL) ===
-    "arsenal": ("espn", "soccer", "eng.1", "Arsenal", "EPL"),
-    "aston villa": ("espn", "soccer", "eng.1", "Aston Villa", "EPL"),
-    "villa": ("espn", "soccer", "eng.1", "Aston Villa", "EPL"),
-    "bournemouth": ("espn", "soccer", "eng.1", "Bournemouth", "EPL"),
-    "brentford": ("espn", "soccer", "eng.1", "Brentford", "EPL"),
-    "brighton": ("espn", "soccer", "eng.1", "Brighton", "EPL"),
-    "chelsea": ("espn", "soccer", "eng.1", "Chelsea", "EPL"),
-    "crystal palace": ("espn", "soccer", "eng.1", "Crystal Palace", "EPL"),
-    "palace": ("espn", "soccer", "eng.1", "Crystal Palace", "EPL"),
-    "everton": ("espn", "soccer", "eng.1", "Everton", "EPL"),
-    "fulham": ("espn", "soccer", "eng.1", "Fulham", "EPL"),
-    "liverpool": ("espn", "soccer", "eng.1", "Liverpool", "EPL"),
-    "man city": ("espn", "soccer", "eng.1", "Manchester City", "EPL"),
-    "manchester city": ("espn", "soccer", "eng.1", "Manchester City", "EPL"),
-    "man utd": ("espn", "soccer", "eng.1", "Manchester United", "EPL"),
-    "manchester united": ("espn", "soccer", "eng.1", "Manchester United", "EPL"),
-    "united": ("espn", "soccer", "eng.1", "Manchester United", "EPL"),
-    "newcastle": ("espn", "soccer", "eng.1", "Newcastle", "EPL"),
-    "forest": ("espn", "soccer", "eng.1", "Nottingham Forest", "EPL"),
-    "nottm forest": ("espn", "soccer", "eng.1", "Nottingham Forest", "EPL"),
-    "spurs epl": ("espn", "soccer", "eng.1", "Tottenham", "EPL"),
-    "tottenham": ("espn", "soccer", "eng.1", "Tottenham", "EPL"),
-    "west ham": ("espn", "soccer", "eng.1", "West Ham", "EPL"),
-    "wolves": ("espn", "soccer", "eng.1", "Wolverhampton", "EPL"),
-    "wolverhampton": ("espn", "soccer", "eng.1", "Wolverhampton", "EPL"),
-    "leicest city": ("espn", "soccer", "eng.1", "Leicester City", "EPL"),
-    "leicest": ("espn", "soccer", "eng.1", "Leicester City", "EPL"),
-    "leicester city": ("espn", "soccer", "eng.1", "Leicester City", "EPL"),
-    # === SOCCER (La Liga) ===
-    "real madrid": ("espn", "soccer", "esp.1", "Real Madrid", "La Liga"),
-    "madrid": ("espn", "soccer", "esp.1", "Real Madrid", "La Liga"),
-    "barcelona": ("espn", "soccer", "esp.1", "Barcelona", "La Liga"),
-    "barca": ("espn", "soccer", "esp.1", "Barcelona", "La Liga"),
-    "atletico madrid": ("espn", "soccer", "esp.1", "Atlético Madrid", "La Liga"),
-    "sevilla": ("espn", "soccer", "esp.1", "Sevilla", "La Liga"),
-    "valencia": ("espn", "soccer", "esp.1", "Valencia", "La Liga"),
-    "villarreal": ("espn", "soccer", "esp.1", "Villarreal", "La Liga"),
-    "real sociedad": ("espn", "soccer", "esp.1", "Real Sociedad", "La Liga"),
+    # === SOCCER (EPL + ENG LEAGUES + CUPS) ===
+    "arsenal": ("espn", "soccer", ENG_SOCCER_SLUGS, "Arsenal", "EPL"),
+    "aston villa": ("espn", "soccer", ENG_SOCCER_SLUGS, "Aston Villa", "EPL"),
+    "villa": ("espn", "soccer", ENG_SOCCER_SLUGS, "Aston Villa", "EPL"),
+    "bournemouth": ("espn", "soccer", ENG_SOCCER_SLUGS, "Bournemouth", "EPL"),
+    "brentford": ("espn", "soccer", ENG_SOCCER_SLUGS, "Brentford", "EPL"),
+    "brighton": ("espn", "soccer", ENG_SOCCER_SLUGS, "Brighton", "EPL"),
+    "chelsea": ("espn", "soccer", ENG_SOCCER_SLUGS, "Chelsea", "EPL"),
+    "crystal palace": ("espn", "soccer", ENG_SOCCER_SLUGS, "Crystal Palace", "EPL"),
+    "palace": ("espn", "soccer", ENG_SOCCER_SLUGS, "Crystal Palace", "EPL"),
+    "everton": ("espn", "soccer", ENG_SOCCER_SLUGS, "Everton", "EPL"),
+    "fulham": ("espn", "soccer", ENG_SOCCER_SLUGS, "Fulham", "EPL"),
+    "liverpool": ("espn", "soccer", ENG_SOCCER_SLUGS, "Liverpool", "EPL"),
+    "man city": ("espn", "soccer", ENG_SOCCER_SLUGS, "Manchester City", "EPL"),
+    "manchester city": ("espn", "soccer", ENG_SOCCER_SLUGS, "Manchester City", "EPL"),
+    "man utd": ("espn", "soccer", ENG_SOCCER_SLUGS, "Manchester United", "EPL"),
+    "manchester united": (
+        "espn",
+        "soccer",
+        ENG_SOCCER_SLUGS,
+        "Manchester United",
+        "EPL",
+    ),
+    "united": ("espn", "soccer", ENG_SOCCER_SLUGS, "Manchester United", "EPL"),
+    "newcastle": ("espn", "soccer", ENG_SOCCER_SLUGS, "Newcastle", "EPL"),
+    "forest": ("espn", "soccer", ENG_SOCCER_SLUGS, "Nottingham Forest", "EPL"),
+    "nottm forest": ("espn", "soccer", ENG_SOCCER_SLUGS, "Nottingham Forest", "EPL"),
+    "spurs epl": ("espn", "soccer", ENG_SOCCER_SLUGS, "Tottenham", "EPL"),
+    "tottenham": ("espn", "soccer", ENG_SOCCER_SLUGS, "Tottenham", "EPL"),
+    "west ham": ("espn", "soccer", ENG_SOCCER_SLUGS, "West Ham", "EPL"),
+    "wolves": ("espn", "soccer", ENG_SOCCER_SLUGS, "Wolverhampton", "EPL"),
+    "wolverhampton": ("espn", "soccer", ENG_SOCCER_SLUGS, "Wolverhampton", "EPL"),
+    "leicest city": ("espn", "soccer", ENG_SOCCER_SLUGS, "Leicester City", "EPL"),
+    "leicest": ("espn", "soccer", ENG_SOCCER_SLUGS, "Leicester City", "EPL"),
+    "leicester city": ("espn", "soccer", ENG_SOCCER_SLUGS, "Leicester City", "EPL"),
+    # === SOCCER (La Liga + ESP LEAGUES + CUPS) ===
+    "alaves": ("espn", "soccer", ESP_SOCCER_SLUGS, "Alavés", "La Liga"),
+    "deportivo alaves": ("espn", "soccer", ESP_SOCCER_SLUGS, "Alavés", "La Liga"),
+    "athletic bilbao": ("espn", "soccer", ESP_SOCCER_SLUGS, "Athletic Club", "La Liga"),
+    "athletic club": ("espn", "soccer", ESP_SOCCER_SLUGS, "Athletic Club", "La Liga"),
+    "atletico madrid": (
+        "espn",
+        "soccer",
+        ESP_SOCCER_SLUGS,
+        "Atlético Madrid",
+        "La Liga",
+    ),
+    "atleti": ("espn", "soccer", ESP_SOCCER_SLUGS, "Atlético Madrid", "La Liga"),
+    "barcelona": ("espn", "soccer", ESP_SOCCER_SLUGS, "Barcelona", "La Liga"),
+    "barca": ("espn", "soccer", ESP_SOCCER_SLUGS, "Barcelona", "La Liga"),
+    "celta vigo": ("espn", "soccer", ESP_SOCCER_SLUGS, "Celta Vigo", "La Liga"),
+    "celta": ("espn", "soccer", ESP_SOCCER_SLUGS, "Celta Vigo", "La Liga"),
+    "deportivo": ("espn", "soccer", ESP_SOCCER_SLUGS, "Deportivo La Coruña", "La Liga"),
+    "deportivo la coruna": (
+        "espn",
+        "soccer",
+        ESP_SOCCER_SLUGS,
+        "Deportivo La Coruña",
+        "La Liga",
+    ),
+    "depor": ("espn", "soccer", ESP_SOCCER_SLUGS, "Deportivo La Coruña", "La Liga"),
+    "elche": ("espn", "soccer", ESP_SOCCER_SLUGS, "Elche CF", "La Liga"),
+    "espanyol": ("espn", "soccer", ESP_SOCCER_SLUGS, "Espanyol", "La Liga"),
+    "getafe": ("espn", "soccer", ESP_SOCCER_SLUGS, "Getafe", "La Liga"),
+    "levante": ("espn", "soccer", ESP_SOCCER_SLUGS, "Levante UD", "La Liga"),
+    "malaga": ("espn", "soccer", ESP_SOCCER_SLUGS, "Málaga", "La Liga"),
+    "osasuna": ("espn", "soccer", ESP_SOCCER_SLUGS, "Osasuna", "La Liga"),
+    "racing santander": (
+        "espn",
+        "soccer",
+        ESP_SOCCER_SLUGS,
+        "Racing Santander",
+        "La Liga",
+    ),
+    "racing": ("espn", "soccer", ESP_SOCCER_SLUGS, "Racing Santander", "La Liga"),
+    "santander": ("espn", "soccer", ESP_SOCCER_SLUGS, "Racing Santander", "La Liga"),
+    "rayo vallecano": ("espn", "soccer", ESP_SOCCER_SLUGS, "Rayo Vallecano", "La Liga"),
+    "rayo": ("espn", "soccer", ESP_SOCCER_SLUGS, "Rayo Vallecano", "La Liga"),
+    "real betis": ("espn", "soccer", ESP_SOCCER_SLUGS, "Real Betis", "La Liga"),
+    "betis": ("espn", "soccer", ESP_SOCCER_SLUGS, "Real Betis", "La Liga"),
+    "real madrid": ("espn", "soccer", ESP_SOCCER_SLUGS, "Real Madrid", "La Liga"),
+    "madrid": ("espn", "soccer", ESP_SOCCER_SLUGS, "Real Madrid", "La Liga"),
+    "real sociedad": ("espn", "soccer", ESP_SOCCER_SLUGS, "Real Sociedad", "La Liga"),
+    "sociedad": ("espn", "soccer", ESP_SOCCER_SLUGS, "Real Sociedad", "La Liga"),
+    "sevilla": ("espn", "soccer", ESP_SOCCER_SLUGS, "Sevilla", "La Liga"),
+    "valencia": ("espn", "soccer", ESP_SOCCER_SLUGS, "Valencia", "La Liga"),
+    "villarreal": ("espn", "soccer", ESP_SOCCER_SLUGS, "Villarreal", "La Liga"),
     # === SOCCER (Bundesliga) ===
     "bayern": ("espn", "soccer", "ger.1", "Bayern Munich", "Bundesliga"),
     "bayern munich": ("espn", "soccer", "ger.1", "Bayern Munich", "Bundesliga"),
@@ -385,18 +484,19 @@ TEAM_MAP = {
     "stamps": ("ha_cfl", "cfl", "Stampeders", "CFL"),
     "bc lions": ("ha_cfl", "cfl", "BC Lions", "CFL"),
     # =========================================================================
-    # === DISABLED MINOR LEAGUES                                            ===
+    # === HOCKEYTECH (OHL/CHL) MINOR LEAGUES                                ===
     # =========================================================================
-    "67s": ("disabled", "Ottawa 67s", "OHL"),
-    "ottawa 67s": ("disabled", "Ottawa 67s", "OHL"),
-    "generals": ("disabled", "Oshawa Generals", "OHL"),
-    "oshawa generals": ("disabled", "Oshawa Generals", "OHL"),
-    "petes": ("disabled", "Peterborough Petes", "OHL"),
-    "peterborough petes": ("disabled", "Peterborough Petes", "OHL"),
-    "knights": ("disabled", "London Knights", "OHL"),
-    "london knights": ("disabled", "London Knights", "OHL"),
-    "rangers ohl": ("disabled", "Kitchener Rangers", "OHL"),
-    "kitchener rangers": ("disabled", "Kitchener Rangers", "OHL"),
+    "67s": ("hockeytech", "ohl", "Ottawa 67's", "OHL"),
+    "ottawa 67s": ("hockeytech", "ohl", "Ottawa 67's", "OHL"),
+    "generals": ("hockeytech", "ohl", "Oshawa Generals", "OHL"),
+    "oshawa generals": ("hockeytech", "ohl", "Oshawa Generals", "OHL"),
+    "petes": ("hockeytech", "ohl", "Peterborough Petes", "OHL"),
+    "peterborough petes": ("hockeytech", "ohl", "Peterborough Petes", "OHL"),
+    "knights": ("hockeytech", "ohl", "London Knights", "OHL"),
+    "london knights": ("hockeytech", "ohl", "London Knights", "OHL"),
+    "rangers ohl": ("hockeytech", "ohl", "Kitchener Rangers", "OHL"),
+    "kitchener rangers": ("hockeytech", "ohl", "Kitchener Rangers", "OHL"),
+    # Paused Minor Leagues (No open APIs available)
     "blackjacks": ("disabled", "Ottawa BlackJacks", "CEBL"),
     "ottawa blackjacks": ("disabled", "Ottawa BlackJacks", "CEBL"),
     "atletico ottawa": ("disabled", "Atletico Ottawa", "CPL"),
@@ -404,17 +504,7 @@ TEAM_MAP = {
     "titans": ("disabled", "Ottawa Titans", "Frontier"),
 }
 
-OTTAWA_TEAMS = [
-    "ottawa senators",
-    "ottawa charge",
-    "ottawa redblacks",
-    "atletico ottawa",
-    "ottawa blackjacks",
-    "ottawa 67s",
-    "ottawa rapid",
-    "ottawa black bears",
-    "ottawa titans",
-]
+OTTAWA_TEAMS = ["ottawa senators", "ottawa charge", "ottawa redblacks", "ottawa 67s"]
 
 TORONTO_TEAMS = [
     "toronto maple leafs",
@@ -439,11 +529,251 @@ def get_local_date(iso_str: str) -> str:
         return iso_str[:10]
 
 
+def get_event_priority(event: dict, league_key: str) -> int:
+    """Returns a priority rank (lower = higher priority) for local interest teams."""
+    tiers = PRIORITY_TEAMS.get(league_key.lower(), [])
+    if not tiers:
+        return 999
+
+    comps = event.get("competitions", [])
+    if not comps:
+        return 999
+
+    competitors = comps[0].get("competitors", [])
+    team_names = []
+    for c in competitors:
+        t = c.get("team", {})
+        team_names.extend(
+            [
+                t.get("displayName", "").lower().replace("'", ""),
+                t.get("shortDisplayName", "").lower().replace("'", ""),
+                t.get("name", "").lower().replace("'", ""),
+                t.get("abbreviation", "").lower().replace("'", ""),
+            ]
+        )
+
+    for rank, aliases in enumerate(tiers):
+        for alias in aliases:
+            clean_alias = alias.replace("'", "")
+            if any(clean_alias in name for name in team_names):
+                return rank
+    return 999
+
+
+async def fetch_hockeytech(
+    search_team: str,
+    client_code: str,
+    league_label: str,
+    scope: str = "default",
+    return_raw: bool = False,
+    max_days: int = 7,
+) -> str:
+    """Directly queries the HockeyTech modulekit feeds for CHL live timekeeper integration."""
+    is_next_query = scope in ["next", "tomorrow"] or (
+        scope == "default" and search_team
+    )
+
+    if is_next_query:
+        # Pings the 'schedule' endpoint directly to bypass the scorebar's 14-day server limit,
+        # seamlessly bringing the September schedule into range during the summer.
+        url = f"https://lscluster.hockeytech.com/feed/index.php?feed=modulekit&view=schedule&client_code={client_code}&key=f1aa699db3d81487"
+    else:
+        # Standard scorebar fetch for 'live', 'today', and 'yesterday' scopes.
+        url = f"https://lscluster.hockeytech.com/feed/index.php?feed=modulekit&view=scorebar&client_code={client_code}&key=f1aa699db3d81487&numberofdaysahead=5&numberofdaysback=5"
+
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
+        )
+        resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
+        raw_data = resp.read()
+        if resp.info().get("Content-Encoding") == "gzip":
+            raw_data = gzip.decompress(raw_data)
+        data = json.loads(raw_data.decode("utf-8"))
+    except Exception as e:
+        if return_raw:
+            return ""
+        return f"[{league_label}] Fetch failed: {e}"
+
+    now = datetime.now()
+    today_date = now.date()
+    yest_date = today_date - timedelta(days=1)
+    tom_date = today_date + timedelta(days=1)
+    cutoff_date = today_date + timedelta(days=max_days)
+
+    sk = data.get("SiteKit", {})
+    score_data = sk.get("Scorebar", [])
+    if not score_data:
+        score_data = sk.get("Schedule", [])
+
+    games_list = []
+    if isinstance(score_data, list):
+        for item in score_data:
+            if isinstance(item, dict) and "games" in item:
+                games_list.extend(item["games"])
+            elif isinstance(item, dict) and "date_played" in item:
+                games_list.append(item)
+
+    events: list[HockeyTechEvent] = []
+    for g in games_list:
+        date_str = str(g.get("date_played", ""))[:10]
+        try:
+            game_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except:
+            continue
+
+        h_code = str(g.get("home_team_code", "???")).upper()
+        a_code = str(g.get("visiting_team_code", "???")).upper()
+        h_name = str(g.get("home_team_name", "")).lower()
+        a_name = str(g.get("visiting_team_name", "")).lower()
+        h_score = str(g.get("home_goal_count", "0"))
+        a_score = str(g.get("visiting_goal_count", "0"))
+
+        status_id = str(g.get("status", "1"))
+        status_txt = str(g.get("game_status", "")).lower()
+
+        if (
+            status_id in ["2", "3"]
+            or "in progress" in status_txt
+            or "live" in status_txt
+        ):
+            status = "playing"
+        elif status_id == "4" or "final" in status_txt:
+            status = "complete"
+        else:
+            status = "scheduled"
+
+        time_str = str(g.get("scheduled_time", "TBD")).replace(" ", "").upper()
+
+        events.append(
+            {
+                "game_date": game_date,
+                "month": game_date.month,
+                "day": game_date.day,
+                "time_str": time_str,
+                "away": a_code,
+                "home": h_code,
+                "away_name": a_name,
+                "home_name": h_name,
+                "away_score": a_score,
+                "home_score": h_score,
+                "status": status,
+                "dt": datetime.combine(game_date, datetime.min.time()),
+            }
+        )
+
+    if search_team:
+        s_name = search_team.lower().replace("'", "").replace("é", "e")
+        events = [
+            e
+            for e in events
+            if s_name in e["away_name"].replace("'", "").replace("é", "e")
+            or s_name in e["home_name"].replace("'", "").replace("é", "e")
+            or s_name == e["away"].lower().replace("'", "")
+            or s_name == e["home"].lower().replace("'", "")
+        ]
+
+    matches = []
+    actual_scope = scope
+    slate_date_str = f"{today_date.month}/{today_date.day}"
+
+    if scope in ["default", "today"]:
+        matches = [e for e in events if e["game_date"] == today_date]
+        if not matches and search_team and scope == "default":
+            future = [e for e in events if today_date < e["game_date"] <= cutoff_date]
+            if future:
+                future.sort(key=lambda x: x["game_date"])
+                matches = [future[0]]
+                actual_scope = "next"
+    elif scope == "live":
+        matches = [e for e in events if e["status"] == "playing"]
+    elif scope == "tomorrow":
+        matches = [e for e in events if e["game_date"] == tom_date]
+        slate_date_str = f"{tom_date.month}/{tom_date.day}"
+    elif scope == "yesterday":
+        matches = [e for e in events if e["game_date"] == yest_date]
+        slate_date_str = f"{yest_date.month}/{yest_date.day}"
+    elif scope == "next":
+        future = [e for e in events if today_date < e["game_date"] <= cutoff_date]
+        if future:
+            future.sort(key=lambda x: x["game_date"])
+            if search_team:
+                matches = [future[0]]
+            else:
+                first_dt = future[0]["game_date"]
+                matches = [e for e in future if e["game_date"] == first_dt]
+
+    if not matches:
+        if return_raw:
+            return ""
+        subj = search_team.title() if search_team else league_label
+        if scope == "live":
+            return f"{'['+league_label+']' if search_team else league_label+':'} No live games{' for '+subj if search_team else ''}."
+        elif scope == "today" or (scope == "default" and not search_team):
+            return f"{'['+league_label+']' if search_team else league_label+':'} No games scheduled {today_date.month}/{today_date.day}{' for '+subj if search_team else ''}."
+        elif scope == "tomorrow":
+            return f"{'['+league_label+']' if search_team else league_label+':'} No games scheduled {tom_date.month}/{tom_date.day}{' for '+subj if search_team else ''}."
+        elif scope == "yesterday":
+            return f"{'['+league_label+']' if search_team else league_label+':'} No games scheduled {yest_date.month}/{yest_date.day}{' for '+subj if search_team else ''}."
+        else:
+            return f"{'['+league_label+']' if search_team else league_label+':'} No upcoming games{' for '+subj if search_team else ''}."
+
+    def ht_priority(evt):
+        tiers = PRIORITY_TEAMS.get(client_code.lower(), [])
+        if not tiers:
+            return 999
+        for rank, aliases in enumerate(tiers):
+            for alias in aliases:
+                clean_alias = alias.replace("'", "")
+                if clean_alias in evt["away_name"].replace(
+                    "'", ""
+                ) or clean_alias in evt["home_name"].replace("'", ""):
+                    return rank
+        return 999
+
+    matches.sort(key=lambda x: (ht_priority(x), x["game_date"]))
+
+    pairs = []
+    for e in matches:
+        if e["status"] == "complete":
+            status_display = "F"
+        elif e["status"] == "playing":
+            status_display = "Live"
+        else:
+            if actual_scope == "next" or e["game_date"] != today_date:
+                status_display = f"{e['month']}/{e['day']} {e['time_str']}"
+            else:
+                status_display = e["time_str"]
+
+        if e["status"] in ["playing", "complete"]:
+            game_str = f"{e['away']} {e['away_score']}-{e['home_score']} {e['home']}({status_display})"
+        else:
+            game_str = f"{e['away']}@{e['home']}({status_display})"
+
+        prefix = "Next: " if actual_scope == "next" and search_team else ""
+        pairs.append(f"{prefix}{game_str}")
+
+    if search_team:
+        res = f"[{league_label}] " + " | ".join(pairs)
+    else:
+        prefix_scope = (
+            f"{league_label} NEXT: "
+            if actual_scope == "next"
+            else f"{league_label} {slate_date_str}: "
+        )
+        res = prefix_scope + " | ".join(pairs)
+
+    if return_raw:
+        return res
+    return res
+
+
 async def fetch_ha_cfl(
     search_team: str,
     league_label: str,
     scope: str = "default",
     return_raw: bool = False,
+    max_days: int = 7,
 ) -> str:
     """Dynamically parses the live CFL scoreboard JSON payload."""
     url = "https://cflscoreboard.cfl.ca/json/scoreboard/rounds.json"
@@ -455,7 +785,6 @@ async def fetch_ha_cfl(
         resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
         raw_data = resp.read()
 
-        # Safely decompress if the server returns a gzip payload
         if resp.info().get("Content-Encoding") == "gzip":
             raw_data = gzip.decompress(raw_data)
 
@@ -469,6 +798,8 @@ async def fetch_ha_cfl(
     target_m = now.month
     target_d = now.day
     tom = now + timedelta(days=1)
+    yest = now - timedelta(days=1)
+    cutoff_dt = now + timedelta(days=max_days)
 
     events: list[CFLEvent] = []
     for week in schedule_data:
@@ -477,17 +808,17 @@ async def fetch_ha_cfl(
             if not date_str:
                 continue
 
-            # Converts ISO 8601 UTC to Local EDT (-4 hours)
-            dt_utc = datetime.strptime(date_str[:19], "%Y-%m-%dT%H:%M:%S")
-            dt_local = dt_utc - timedelta(hours=4)
+            try:
+                dt_utc = datetime.strptime(date_str[:19], "%Y-%m-%dT%H:%M:%S")
+                dt_local = dt_utc - timedelta(hours=4)
+            except:
+                continue
 
             home = game.get("homeSquad", {})
             away = game.get("awaySquad", {})
 
             api_status = game.get("status", "scheduled").lower()
 
-            # Failsafe: Combats API lag by forcing a game to "playing" if it's past kickoff
-            # and the CFL hasn't updated the payload to 'complete' yet.
             if api_status in ["playing", "in progress", "in-progress"]:
                 status = "playing"
             elif api_status in ["complete", "final"]:
@@ -502,7 +833,7 @@ async def fetch_ha_cfl(
                 {
                     "month": dt_local.month,
                     "day": dt_local.day,
-                    "time_str": dt_local.strftime("%I:%M %p").lstrip("0"),
+                    "time_str": dt_local.strftime("%I:%M%p").lstrip("0"),
                     "away": away.get("shortName", "???").upper(),
                     "home": home.get("shortName", "???").upper(),
                     "away_name": away.get("name", "").lower(),
@@ -515,23 +846,24 @@ async def fetch_ha_cfl(
             )
 
     if search_team:
-        s_name = search_team.lower()
+        s_name = search_team.lower().replace("'", "").replace("é", "e")
         events = [
             e
             for e in events
-            if s_name in e["away_name"]
-            or s_name in e["home_name"]
-            or s_name == e["away"].lower()
-            or s_name == e["home"].lower()
+            if s_name in e["away_name"].replace("'", "").replace("é", "e")
+            or s_name in e["home_name"].replace("'", "").replace("é", "e")
+            or s_name == e["away"].lower().replace("'", "")
+            or s_name == e["home"].lower().replace("'", "")
         ]
 
     matches: list[CFLEvent] = []
     actual_scope = scope
+    slate_date_str = f"{target_m}/{target_d}"
 
     if scope in ["default", "today"]:
         matches = [e for e in events if e["month"] == target_m and e["day"] == target_d]
         if not matches and search_team and scope == "default":
-            future = [e for e in events if e["dt"] > now]
+            future = [e for e in events if now < e["dt"] <= cutoff_dt]
             if future:
                 future.sort(key=lambda x: x["dt"])
                 matches = [future[0]]
@@ -540,8 +872,14 @@ async def fetch_ha_cfl(
         matches = [e for e in events if e["status"] == "playing"]
     elif scope == "tomorrow":
         matches = [e for e in events if e["month"] == tom.month and e["day"] == tom.day]
+        slate_date_str = f"{tom.month}/{tom.day}"
+    elif scope == "yesterday":
+        matches = [
+            e for e in events if e["month"] == yest.month and e["day"] == yest.day
+        ]
+        slate_date_str = f"{yest.month}/{yest.day}"
     elif scope == "next":
-        future = [e for e in events if e["dt"] > now]
+        future = [e for e in events if now < e["dt"] <= cutoff_dt]
         if future:
             future.sort(key=lambda x: x["dt"])
             if search_team:
@@ -557,9 +895,17 @@ async def fetch_ha_cfl(
     if not matches:
         if return_raw:
             return ""
-        display_scope = "today" if scope == "default" and not search_team else scope
         subj = search_team.title() if search_team else league_label
-        return f"{'['+league_label+']' if search_team else league_label+':'} No games {display_scope}{' for '+subj if search_team else ''}."
+        if scope == "live":
+            return f"{'['+league_label+']' if search_team else league_label+':'} No live games{' for '+subj if search_team else ''}."
+        elif scope == "today" or (scope == "default" and not search_team):
+            return f"{'['+league_label+']' if search_team else league_label+':'} No games scheduled {target_m}/{target_d}{' for '+subj if search_team else ''}."
+        elif scope == "tomorrow":
+            return f"{'['+league_label+']' if search_team else league_label+':'} No games scheduled {tom.month}/{tom.day}{' for '+subj if search_team else ''}."
+        elif scope == "yesterday":
+            return f"{'['+league_label+']' if search_team else league_label+':'} No games scheduled {yest.month}/{yest.day}{' for '+subj if search_team else ''}."
+        else:
+            return f"{'['+league_label+']' if search_team else league_label+':'} No upcoming games{' for '+subj if search_team else ''}."
 
     pairs = []
     for e in matches:
@@ -576,10 +922,9 @@ async def fetch_ha_cfl(
                 status_display = e["time_str"]
 
         if e["status"] in ["playing", "complete"]:
-            score_str = f" {e['away_score']} @ {e['home']} {e['home_score']}"
-            game_str = f"{e['away']}{score_str}({status_display})"
+            game_str = f"{e['away']} {e['away_score']}-{e['home_score']} {e['home']}({status_display})"
         else:
-            game_str = f"{e['away']} @ {e['home']}({status_display})"
+            game_str = f"{e['away']}@{e['home']}({status_display})"
 
         prefix = "Next: " if actual_scope == "next" and search_team else ""
         pairs.append(f"{prefix}{game_str}")
@@ -590,9 +935,9 @@ async def fetch_ha_cfl(
         prefix_scope = (
             f"{league_label} NEXT: "
             if actual_scope == "next"
-            else f"{league_label} {actual_scope.upper()}: "
+            else f"{league_label} {slate_date_str}: "
         )
-        res = prefix_scope + ", ".join(pairs)
+        res = prefix_scope + " | ".join(pairs)
 
     if return_raw:
         return res
@@ -637,11 +982,11 @@ def format_event(event: dict, team_query: str = "", scope: str = "") -> str:
         a_score = away.get("score", "0")
 
         if state == "in":
-            return f"{a_abbr} {a_score} @ {h_abbr} {h_score}"
+            return f"{a_abbr} {a_score}-{h_score} {h_abbr}"
         elif state == "post":
             if "postponed" in detail.lower() or "canceled" in detail.lower():
-                return f"{a_abbr} @ {h_abbr}({detail})"
-            return f"{a_abbr} {a_score} @ {h_abbr} {h_score}(F)"
+                return f"{a_abbr}@{h_abbr}({detail})"
+            return f"{a_abbr} {a_score}-{h_score} {h_abbr}(F)"
         else:
             event_date = event.get("date", "")
             if event_date:
@@ -649,7 +994,7 @@ def format_event(event: dict, team_query: str = "", scope: str = "") -> str:
                     clean_date = event_date.replace("Z", "+00:00")
                     dt = datetime.fromisoformat(clean_date) - timedelta(hours=4)
 
-                    time_fmt = dt.strftime("%I:%M %p").lstrip("0")
+                    time_fmt = dt.strftime("%I:%M%p").lstrip("0")
 
                     if "TBD" in detail.upper() or dt.strftime("%H:%M") in [
                         "00:00",
@@ -659,7 +1004,7 @@ def format_event(event: dict, team_query: str = "", scope: str = "") -> str:
                     else:
                         time_str = time_fmt
 
-                    if scope in ["today", "tomorrow"]:
+                    if scope in ["today", "tomorrow", "yesterday"]:
                         t = time_str
                     else:
                         t = f"{dt.month}/{dt.day} {time_str}".strip()
@@ -669,16 +1014,164 @@ def format_event(event: dict, team_query: str = "", scope: str = "") -> str:
                 t = "TBD"
 
             prefix = "Next: " if scope == "next" and team_query else ""
-            return f"{prefix}{a_abbr} @ {h_abbr}({t})"
+            return f"{prefix}{a_abbr}@{h_abbr}({t})"
     except Exception:
         return ""
 
 
-def fetch_f1_slate(scope: str = "default") -> str:
+def fetch_ufc_slate(scope: str = "default", max_days: int = 7) -> str:
+    """Fetches UFC events and formats individual fights. Reverses fight list to ensure Main Events print first."""
+    now = datetime.now()
+    today_date = now.date()
+    yest_date = today_date - timedelta(days=1)
+    tom_date = today_date + timedelta(days=1)
+    cutoff_date = today_date + timedelta(days=max_days)
+
+    if scope == "yesterday":
+        date_param = f"&dates={yest_date.strftime('%Y%m%d')}"
+        slate_date_str = f"{yest_date.month}/{yest_date.day}"
+    elif scope == "tomorrow":
+        date_param = f"&dates={tom_date.strftime('%Y%m%d')}"
+        slate_date_str = f"{tom_date.month}/{tom_date.day}"
+    elif scope in ["today", "default", "live"]:
+        date_param = f"&dates={today_date.strftime('%Y%m%d')}"
+        slate_date_str = f"{today_date.month}/{today_date.day}"
+    else:  # next
+        date_param = f"&dates={today_date.strftime('%Y%m%d')}-{(today_date + timedelta(days=30)).strftime('%Y%m%d')}"
+        slate_date_str = f"{today_date.month}/{today_date.day}"
+
+    url = f"https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard?limit=200{date_param}"
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            raw_data = response.read()
+            if response.info().get("Content-Encoding") == "gzip":
+                raw_data = gzip.decompress(raw_data)
+            data = json.loads(raw_data.decode("utf-8"))
+
+        events = data.get("events", [])
+
+        if not events:
+            if scope == "live":
+                return "UFC LIVE: No live events."
+            elif scope in ["yesterday", "tomorrow"]:
+                return f"UFC: No events {scope}."
+            return f"UFC: No events scheduled on {slate_date_str}."
+
+        events.sort(key=lambda x: x.get("date", ""))
+
+        if scope in ["next", "default"]:
+            for e in events:
+                if (
+                    e.get("competitions", [{}])[0]
+                    .get("status", {})
+                    .get("type", {})
+                    .get("state", "")
+                    == "pre"
+                ):
+                    dt = datetime.fromisoformat(
+                        e.get("date", "").replace("Z", "+00:00")
+                    ) - timedelta(hours=4)
+                    if dt.date() <= cutoff_date:
+                        name = e.get("shortName", e.get("name", "UFC Event"))
+                        return f"UFC NEXT: {name} ({dt.month}/{dt.day})"
+                    else:
+                        return "UFC: No events found."
+            return "UFC NEXT: No upcoming events scheduled."
+
+        target_events = []
+        for e in events:
+            state = (
+                e.get("competitions", [{}])[0]
+                .get("status", {})
+                .get("type", {})
+                .get("state", "")
+            )
+            if scope == "live" and state != "in":
+                continue
+            if scope != "live":
+                d_str = get_local_date(e.get("date", ""))
+                if scope in ["default", "today"] and d_str != today_date.strftime(
+                    "%Y-%m-%d"
+                ):
+                    continue
+                if scope == "tomorrow" and d_str != tom_date.strftime("%Y-%m-%d"):
+                    continue
+                if scope == "yesterday" and d_str != yest_date.strftime("%Y-%m-%d"):
+                    continue
+            target_events.append(e)
+
+        if not target_events:
+            if scope == "live":
+                return "UFC LIVE: No live events."
+            if scope in ["yesterday", "tomorrow"]:
+                return f"UFC: No events {scope}."
+            return f"UFC: No events scheduled on {slate_date_str}."
+
+        e = target_events[0]
+        event_name = e.get("shortName", e.get("name", "UFC Event"))
+
+        has_live = any(
+            comp.get("status", {}).get("type", {}).get("state", "") == "in"
+            for comp in e.get("competitions", [])
+        )
+
+        if scope == "live" or (scope in ["today", "default"] and has_live):
+            prefix = "UFC LIVE"
+        elif scope in ["yesterday", "tomorrow"]:
+            prefix = "UFC"
+        else:
+            prefix = f"UFC {slate_date_str}"
+
+        fights = []
+        for comp in reversed(e.get("competitions", [])):
+            comps = comp.get("competitors", [])
+            if len(comps) < 2:
+                continue
+
+            def get_fighter_name(c):
+                ath = c.get("athlete", {})
+                name = (
+                    ath.get("shortName")
+                    or ath.get("lastName")
+                    or ath.get("displayName", "???")
+                )
+                if ". " in name:
+                    name = name.split(". ")[-1]
+                elif " " in name and len(name.split()) > 1:
+                    name = name.split()[-1]
+                return name[:7].upper()
+
+            f1, f2 = comps[0], comps[1]
+            f1_name = get_fighter_name(f1)
+            f2_name = get_fighter_name(f2)
+
+            if f1.get("winner"):
+                fights.append(f"W {f1_name}/{f2_name}")
+            elif f2.get("winner"):
+                fights.append(f"{f1_name}/{f2_name} W")
+            else:
+                fights.append(f"{f1_name}/{f2_name}")
+
+        fights_str = " | ".join(fights)
+        return f"{prefix}: {event_name} - {fights_str}"
+
+    except Exception as e:
+        return f"Fetch failed: {e}"
+
+
+def fetch_f1_slate(scope: str = "default", max_days: int = 7) -> str:
     url = "https://site.api.espn.com/apis/site/v2/sports/racing/f1/scoreboard"
     req = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
     )
+    now = datetime.now()
+    today_date = now.date()
+    cutoff_date = today_date + timedelta(days=max_days)
+
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             raw_data = response.read()
@@ -690,22 +1183,6 @@ def fetch_f1_slate(scope: str = "default") -> str:
         if not events:
             return "F1: No events found."
         events.sort(key=lambda x: x.get("date", ""))
-
-        if scope == "next":
-            for e in events:
-                if (
-                    e.get("competitions", [{}])[0]
-                    .get("status", {})
-                    .get("type", {})
-                    .get("state", "")
-                    == "pre"
-                ):
-                    name = e.get("shortName", e.get("name", "Race"))
-                    dt = datetime.fromisoformat(
-                        e.get("date", "").replace("Z", "+00:00")
-                    )
-                    return f"F1 NEXT: {name} ({dt.month}/{dt.day})"
-            return "F1: No upcoming races scheduled."
 
         live_events = [
             e
@@ -733,9 +1210,14 @@ def fetch_f1_slate(scope: str = "default") -> str:
                 .get("state", "")
                 == "pre"
             ):
-                name = e.get("shortName", e.get("name", "Race"))
-                dt = datetime.fromisoformat(e.get("date", "").replace("Z", "+00:00"))
-                return f"F1 NEXT: {name} ({dt.month}/{dt.day})"
+                dt = datetime.fromisoformat(
+                    e.get("date", "").replace("Z", "+00:00")
+                ) - timedelta(hours=4)
+                if dt.date() <= cutoff_date:
+                    name = e.get("shortName", e.get("name", "Race"))
+                    return f"F1 NEXT: {name} ({dt.month}/{dt.day})"
+                else:
+                    return "F1: No events found."
         return "F1: No live or upcoming races."
     except Exception as e:
         return f"Fetch failed: {e}"
@@ -744,8 +1226,25 @@ def fetch_f1_slate(scope: str = "default") -> str:
 def fetch_espn_league_slate(
     sport: str, league: str, display_name: str, scope: str = "default"
 ) -> str:
-    url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard?limit=200"
     now = datetime.now()
+    today_date = now.date()
+    yest_date = today_date - timedelta(days=1)
+    tom_date = today_date + timedelta(days=1)
+
+    if scope == "yesterday":
+        date_param = f"&dates={yest_date.strftime('%Y%m%d')}"
+        slate_date_str = f"{yest_date.month}/{yest_date.day}"
+    elif scope == "tomorrow":
+        date_param = f"&dates={tom_date.strftime('%Y%m%d')}"
+        slate_date_str = f"{tom_date.month}/{tom_date.day}"
+    elif scope in ["today", "live"]:
+        date_param = f"&dates={today_date.strftime('%Y%m%d')}"
+        slate_date_str = f"{today_date.month}/{today_date.day}"
+    else:  # default league queries ("today") or "next"
+        date_param = f"&dates={today_date.strftime('%Y%m%d')}-{(today_date + timedelta(days=30)).strftime('%Y%m%d')}"
+        slate_date_str = f"{today_date.month}/{today_date.day}"
+
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard?limit=200{date_param}"
     req = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
     )
@@ -759,16 +1258,16 @@ def fetch_espn_league_slate(
 
         events = data.get("events", [])
 
-        display_scope = "today" if scope == "default" else scope
         if not events:
-            return f"{display_name}: No games {display_scope}."
+            if scope == "live":
+                return f"{display_name}: No live games."
+            if scope in ["default", "today"]:
+                return f"{display_name}: No games scheduled {today_date.month}/{today_date.day}."
+            return f"{display_name}: No games {scope}."
 
-        events.sort(key=lambda x: x.get("date", ""))
+        events.sort(key=lambda x: (get_event_priority(x, league), x.get("date", "")))
+
         pairs = []
-        target_m = now.month
-        target_d = now.day
-        tom = now + timedelta(days=1)
-
         if scope == "next":
             pre_events = [
                 e
@@ -782,40 +1281,19 @@ def fetch_espn_league_slate(
             if not pre_events:
                 return f"{display_name}: No upcoming games scheduled."
 
-            future_events = []
-            for e in pre_events:
-                d_str = get_local_date(e.get("date", ""))
-                try:
-                    dt = datetime.strptime(d_str, "%Y-%m-%d")
-                    if dt.month > target_m or (
-                        dt.month == target_m and dt.day >= target_d
-                    ):
-                        future_events.append(e)
-                except:
-                    pass
-
-            if not future_events:
-                return f"{display_name}: No upcoming games scheduled."
-
-            first_date = get_local_date(future_events[0].get("date", ""))
-            first_m = datetime.strptime(first_date, "%Y-%m-%d").month
-            first_d = datetime.strptime(first_date, "%Y-%m-%d").day
-
+            first_date = get_local_date(pre_events[0].get("date", ""))
             next_slate = [
-                e
-                for e in future_events
-                if datetime.strptime(
-                    get_local_date(e.get("date", "")), "%Y-%m-%d"
-                ).month
-                == first_m
-                and datetime.strptime(get_local_date(e.get("date", "")), "%Y-%m-%d").day
-                == first_d
+                e for e in pre_events if get_local_date(e.get("date", "")) == first_date
             ]
+            next_slate.sort(
+                key=lambda x: (get_event_priority(x, league), x.get("date", ""))
+            )
+
             for e in next_slate:
                 formatted = format_event(e, scope=scope)
                 if formatted:
                     pairs.append(formatted)
-            return f"{display_name} NEXT: " + ", ".join(pairs)
+            return f"{display_name} NEXT: " + " | ".join(pairs)
 
         for e in events:
             state = (
@@ -826,18 +1304,9 @@ def fetch_espn_league_slate(
             )
             if scope == "live" and state != "in":
                 continue
-
-            d_str = get_local_date(e.get("date", ""))
-            try:
-                dt = datetime.strptime(d_str, "%Y-%m-%d")
-            except:
-                continue
-
-            if scope in ["default", "today", "live"] and (
-                dt.month != target_m or dt.day != target_d
-            ):
-                continue
-            if scope == "tomorrow" and (dt.month != tom.month or dt.day != tom.day):
+            if scope in ["default", "today"] and get_local_date(
+                e.get("date", "")
+            ) != today_date.strftime("%Y-%m-%d"):
                 continue
 
             formatted = format_event(e, scope=scope)
@@ -845,38 +1314,75 @@ def fetch_espn_league_slate(
                 pairs.append(formatted)
 
         if not pairs:
-            return f"{display_name}: No {'live ' if scope=='live' else ''}games {display_scope}."
-        return f"{display_name} {scope.upper()}: " + ", ".join(pairs)
+            if scope == "live":
+                return f"{display_name}: No live games."
+            if scope in ["default", "today"]:
+                return f"{display_name}: No games scheduled {today_date.month}/{today_date.day}."
+            return f"{display_name}: No games {scope}."
+
+        prefix_scope = (
+            f"{display_name} LIVE: "
+            if scope == "live"
+            else f"{display_name} {slate_date_str}: "
+        )
+        return prefix_scope + " | ".join(pairs)
     except Exception as e:
+        if "400" in str(e):
+            if scope == "live":
+                return f"{display_name}: No live games."
+            if scope in ["default", "today"]:
+                return f"{display_name}: No games scheduled {today_date.month}/{today_date.day}."
+            return f"{display_name}: No upcoming games scheduled."
         return f"Fetch failed: {e}"
 
 
 def fetch_espn_team(
     sport: str,
-    league: str,
+    league_input: str,
     search_name: str,
     league_label: str,
     team_query: str,
     scope: str = "default",
     return_raw=False,
+    max_days: int = 7,
 ) -> str:
     now = datetime.now()
-    url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard?limit=1000"
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            raw_data = response.read()
-            if response.info().get("Content-Encoding") == "gzip":
-                raw_data = gzip.decompress(raw_data)
-            all_raw_events = json.loads(raw_data.decode("utf-8")).get("events", [])
-    except:
-        all_raw_events = []
+    today_date = now.date()
+    yest_date = today_date - timedelta(days=1)
+    tom_date = today_date + timedelta(days=1)
+    cutoff_date = today_date + timedelta(days=max_days)
+
+    if scope == "yesterday":
+        date_param = f"&dates={yest_date.strftime('%Y%m%d')}"
+    elif scope == "tomorrow":
+        date_param = f"&dates={tom_date.strftime('%Y%m%d')}"
+    elif scope in ["today", "live"]:
+        date_param = f"&dates={today_date.strftime('%Y%m%d')}"
+    else:
+        date_param = f"&dates={today_date.strftime('%Y%m%d')}-{(today_date + timedelta(days=30)).strftime('%Y%m%d')}"
+
+    leagues = league_input.split(",")
+    all_raw_events = []
+
+    # Check multiple leagues if provided (e.g., cross-competition or relegations)
+    for l_id in leagues:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{l_id}/scoreboard?limit=1000{date_param}"
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                raw_data = response.read()
+                if response.info().get("Content-Encoding") == "gzip":
+                    raw_data = gzip.decompress(raw_data)
+                events = json.loads(raw_data.decode("utf-8")).get("events", [])
+                all_raw_events.extend(events)
+        except:
+            continue
 
     team_events = []
     seen_event_ids = set()
-    s_name = search_name.lower().replace("é", "e")
+    s_name = search_name.lower().replace("'", "").replace("é", "e")
 
     for e in all_raw_events:
         eid = e.get("id")
@@ -891,16 +1397,16 @@ def fetch_espn_team(
 
         c0, c1 = competitors[0].get("team", {}), competitors[1].get("team", {})
         c0_names = [
-            c0.get("displayName", "").lower(),
-            c0.get("shortDisplayName", "").lower(),
-            c0.get("name", "").lower(),
-            c0.get("abbreviation", "").lower(),
+            c0.get("displayName", "").lower().replace("'", ""),
+            c0.get("shortDisplayName", "").lower().replace("'", ""),
+            c0.get("name", "").lower().replace("'", ""),
+            c0.get("abbreviation", "").lower().replace("'", ""),
         ]
         c1_names = [
-            c1.get("displayName", "").lower(),
-            c1.get("shortDisplayName", "").lower(),
-            c1.get("name", "").lower(),
-            c1.get("abbreviation", "").lower(),
+            c1.get("displayName", "").lower().replace("'", ""),
+            c1.get("shortDisplayName", "").lower().replace("'", ""),
+            c1.get("name", "").lower().replace("'", ""),
+            c1.get("abbreviation", "").lower().replace("'", ""),
         ]
 
         if any(s_name in n for n in c0_names) or any(s_name in n for n in c1_names):
@@ -911,7 +1417,14 @@ def fetch_espn_team(
     if not team_events:
         if return_raw:
             return ""
-        display_scope = "today" if scope == "default" else scope
+        if scope == "live":
+            return f"[{league_label}] No live games for {search_name.title()}."
+        elif scope == "today":
+            return f"[{league_label}] No games scheduled {today_date.month}/{today_date.day} for {search_name.title()}."
+        elif scope == "tomorrow":
+            return f"[{league_label}] No games scheduled {tom_date.month}/{tom_date.day} for {search_name.title()}."
+        elif scope == "yesterday":
+            return f"[{league_label}] No games scheduled {yest_date.month}/{yest_date.day} for {search_name.title()}."
         return (
             f"[{league_label}] No upcoming games scheduled for {search_name.title()}."
         )
@@ -939,9 +1452,15 @@ def fetch_espn_team(
             if fmt:
                 return f"[{league_label}] Live Now: " + fmt
         if pre:
-            fmt = format_event(pre[0], team_query, scope)
-            if fmt:
-                return f"[{league_label}] " + fmt
+            next_date_str = get_local_date(pre[0].get("date", ""))
+            try:
+                next_date = datetime.strptime(next_date_str, "%Y-%m-%d").date()
+            except:
+                next_date = None
+            if next_date and next_date <= cutoff_date:
+                fmt = format_event(pre[0], team_query, scope)
+                if fmt:
+                    return f"[{league_label}] " + fmt
         if return_raw:
             return ""
         return (
@@ -949,44 +1468,50 @@ def fetch_espn_team(
         )
 
     msg_parts = []
-    target_m, target_d = now.month, now.day
-    tom = now + timedelta(days=1)
 
     if scope in ["default", "today", "live"]:
         if live:
             fmt = format_event(live[0], team_query, scope)
             if fmt:
                 msg_parts.append(fmt)
-        else:
-            today_games = []
-            for g in post + pre:
-                try:
-                    dt = datetime.strptime(
-                        get_local_date(g.get("date", "")), "%Y-%m-%d"
-                    )
-                    if dt.month == target_m and dt.day == target_d:
-                        today_games.append(g)
-                except:
-                    pass
+        elif scope != "live":
+            today_games = [
+                g
+                for g in post + pre
+                if get_local_date(g.get("date", "")) == today_date.strftime("%Y-%m-%d")
+            ]
             if today_games:
                 fmt = format_event(today_games[-1], team_query, scope)
                 if fmt:
                     msg_parts.append(fmt)
             elif scope == "default" and pre:
-                fmt = format_event(pre[0], team_query, "next")
-                if fmt:
-                    msg_parts.append(fmt)
+                next_date_str = get_local_date(pre[0].get("date", ""))
+                try:
+                    next_date = datetime.strptime(next_date_str, "%Y-%m-%d").date()
+                except:
+                    next_date = None
+                if next_date and next_date <= cutoff_date:
+                    fmt = format_event(pre[0], team_query, "next")
+                    if fmt:
+                        msg_parts.append(fmt)
     elif scope == "tomorrow":
-        tom_games = []
-        for g in team_events:
-            try:
-                dt = datetime.strptime(get_local_date(g.get("date", "")), "%Y-%m-%d")
-                if dt.month == tom.month and dt.day == tom.day:
-                    tom_games.append(g)
-            except:
-                pass
+        tom_games = [
+            g
+            for g in team_events
+            if get_local_date(g.get("date", "")) == tom_date.strftime("%Y-%m-%d")
+        ]
         if tom_games:
             fmt = format_event(tom_games[0], team_query, scope)
+            if fmt:
+                msg_parts.append(fmt)
+    elif scope == "yesterday":
+        yest_games = [
+            g
+            for g in team_events
+            if get_local_date(g.get("date", "")) == yest_date.strftime("%Y-%m-%d")
+        ]
+        if yest_games:
+            fmt = format_event(yest_games[0], team_query, scope)
             if fmt:
                 msg_parts.append(fmt)
 
@@ -995,8 +1520,15 @@ def fetch_espn_team(
 
     if return_raw:
         return ""
-    display_scope = "today" if scope == "default" else scope
-    return f"[{league_label}] No games {display_scope} for {search_name.title()}."
+    if scope == "live":
+        return f"[{league_label}] No live games for {search_name.title()}."
+    elif scope == "today":
+        return f"[{league_label}] No games scheduled {today_date.month}/{today_date.day} for {search_name.title()}."
+    elif scope == "tomorrow":
+        return f"[{league_label}] No games scheduled {tom_date.month}/{tom_date.day} for {search_name.title()}."
+    elif scope == "yesterday":
+        return f"[{league_label}] No games scheduled {yest_date.month}/{yest_date.day} for {search_name.title()}."
+    return f"[{league_label}] No upcoming games scheduled for {search_name.title()}."
 
 
 async def fetch_city_slate(city_query: str, scope: str) -> str:
@@ -1005,7 +1537,6 @@ async def fetch_city_slate(city_query: str, scope: str) -> str:
         if city_query == "ottawa"
         else TORONTO_TEAMS if city_query == "toronto" else []
     )
-    team_scope = "today" if scope == "default" else scope
     results = []
 
     for team_key in teams:
@@ -1022,32 +1553,162 @@ async def fetch_city_slate(city_query: str, scope: str) -> str:
                     lookup[3],
                     lookup[4],
                     team_key,
-                    team_scope,
+                    scope,
                     True,
+                    7,
                 )
             elif source == "ha_cfl":
-                res = await fetch_ha_cfl(lookup[2], lookup[3], team_scope, True)
+                res = await fetch_ha_cfl(lookup[2], lookup[3], scope, True, 7)
+            elif source == "hockeytech":
+                res = await fetch_hockeytech(
+                    lookup[2], lookup[1], lookup[3], scope, True, 7
+                )
             elif source == "disabled":
                 continue
-            if res and "No games" not in res and "No upcoming" not in res:
+            if (
+                res
+                and "No games" not in res
+                and "No upcoming" not in res
+                and "No live" not in res
+            ):
                 results.append(res)
         except:
             continue
 
-    if not results:
-        display_scope = "today" if scope == "default" else scope
-        return (
-            f"YOW {display_scope.title()}: No games scheduled."
-            if city_query == "ottawa"
-            else f"{city_query.title()} Sports: No games {display_scope}."
-        )
+    display_scope = "" if scope == "default" else f" {scope.title()}"
+    city_prefix = "YOW" if city_query == "ottawa" else city_query.title()
 
-    display_scope = "today" if scope == "default" else scope
-    return (
-        f"YOW {display_scope.title()}: "
-        if city_query == "ottawa"
-        else f"{city_query.title()} Sports: "
-    ) + " || ".join(results)
+    if not results:
+        if scope == "live":
+            return f"{city_prefix} Live: No live games."
+        return f"{city_prefix}{display_scope}: No games scheduled."
+
+    return f"{city_prefix}{display_scope}: " + " | ".join(results)
+
+
+async def fetch_gceazy_slate(scope: str) -> str:
+    results = []
+
+    # 1. Raptors (NBA)
+    try:
+        res = await asyncio.to_thread(
+            fetch_espn_team,
+            "basketball",
+            "nba",
+            "Raptors",
+            "NBA",
+            "toronto raptors",
+            scope,
+            True,
+            7,
+        )
+        if res:
+            results.append(res)
+    except:
+        pass
+
+    # 2. Jays (MLB)
+    try:
+        res = await asyncio.to_thread(
+            fetch_espn_team,
+            "baseball",
+            "mlb",
+            "Blue Jays",
+            "MLB",
+            "toronto blue jays",
+            scope,
+            True,
+            7,
+        )
+        if res:
+            results.append(res)
+    except:
+        pass
+
+    # 3. Senators (NHL)
+    try:
+        res = await asyncio.to_thread(
+            fetch_espn_team,
+            "hockey",
+            "nhl",
+            "Senators",
+            "NHL",
+            "ottawa senators",
+            scope,
+            True,
+            7,
+        )
+        if res:
+            results.append(res)
+    except:
+        pass
+
+    # 4. F1
+    try:
+        f1_res = await asyncio.to_thread(fetch_f1_slate, scope, 7)
+        if (
+            f1_res
+            and "No events" not in f1_res
+            and "No upcoming" not in f1_res
+            and "No live" not in f1_res
+        ):
+            results.append(f1_res)
+    except:
+        pass
+
+    # 5. Tempo (WNBA)
+    try:
+        res = await asyncio.to_thread(
+            fetch_espn_team,
+            "basketball",
+            "wnba",
+            "Tempo",
+            "WNBA",
+            "toronto tempo",
+            scope,
+            True,
+            7,
+        )
+        if res:
+            results.append(res)
+    except:
+        pass
+
+    # 6. UFC
+    try:
+        ufc_res = await asyncio.to_thread(fetch_ufc_slate, scope, 7)
+        if (
+            ufc_res
+            and "No events" not in ufc_res
+            and "No upcoming" not in ufc_res
+            and "No live" not in ufc_res
+        ):
+            results.append(ufc_res)
+    except:
+        pass
+
+    # 7. Leicester City (EPL)
+    try:
+        res = await asyncio.to_thread(
+            fetch_espn_team,
+            "soccer",
+            ENG_SOCCER_SLUGS,
+            "Leicester City",
+            "EPL",
+            "leicester city",
+            scope,
+            True,
+            7,
+        )
+        if res:
+            results.append(res)
+    except:
+        pass
+
+    if not results:
+        return "No events in next 7 days."
+
+    return " | ".join(results)
 
 
 @command("score", help="Get sports scores or live slates")
@@ -1060,17 +1721,17 @@ async def score(ctx: Context) -> str:
     )
 
     if not query:
-        return f"@[{who}] Try !score help for commands. Leagues: {', '.join(VALID_LEAGUES)}"
+        return f"@[{who}] Try !score help for commands. Leagues: {HELP_LEAGUES}"
 
     parts = query.lower().split()
     if parts[0] == "help":
-        return f"@[{who}] !score help: [team] OR [league] [today/tomorrow/next/live]. Leagues: {', '.join(VALID_LEAGUES)}"
+        return f"@[{who}] !score help: [team] OR [league] [today/tomorrow/yesterday/next/live]. Leagues: {HELP_LEAGUES}"
     if parts[0] == "live" and len(parts) == 1:
-        return f"@[{who}] Use format !score [league] live. Leagues: {', '.join(VALID_LEAGUES)}"
+        return f"@[{who}] Use format !score [league] live. Leagues: {HELP_LEAGUES}"
 
     scope = "default"
     league_or_team = query.lower()
-    if parts[-1] in ["today", "tomorrow", "next", "live"]:
+    if parts[-1] in ["today", "tomorrow", "yesterday", "next", "live"]:
         scope = parts[-1]
         league_or_team = " ".join(parts[:-1]).strip()
 
@@ -1082,21 +1743,31 @@ async def score(ctx: Context) -> str:
             score_text = AMBIGUOUS_MAP[league_or_team]
         elif league_or_team in ["ottawa", "toronto"]:
             score_text = await fetch_city_slate(league_or_team, scope)
+        elif league_or_team == "gceazy":
+            score_text = await fetch_gceazy_slate(scope)
         elif league_or_team == "f1":
             score_text = await asyncio.to_thread(fetch_f1_slate, scope)
+        elif league_or_team in ["ufc", "mma"]:
+            score_text = await asyncio.to_thread(fetch_ufc_slate, scope)
         elif league_or_team in LEAGUE_MAP:
             lookup = LEAGUE_MAP[league_or_team]
-            if lookup[0] == "espn":
+            if lookup[0] == "disabled":
+                score_text = f"[{lookup[2]}] API access currently unavailable."
+            elif lookup[0] == "espn":
                 score_text = await asyncio.to_thread(
                     fetch_espn_league_slate, lookup[1], lookup[2], lookup[3], scope
                 )
             elif lookup[0] == "ha_cfl":
                 score_text = await fetch_ha_cfl("", lookup[2], scope, False)
-            else:
-                score_text = f"[{lookup[2]}] Integration paused."
+            elif lookup[0] == "hockeytech":
+                score_text = await fetch_hockeytech(
+                    "", lookup[1], lookup[2], scope, False
+                )
         elif league_or_team in TEAM_MAP:
             lookup = TEAM_MAP[league_or_team]
-            if lookup[0] == "espn":
+            if lookup[0] == "disabled":
+                score_text = f"[{lookup[3]}] API access currently unavailable."
+            elif lookup[0] == "espn":
                 score_text = await asyncio.to_thread(
                     fetch_espn_team,
                     lookup[1],
@@ -1108,8 +1779,10 @@ async def score(ctx: Context) -> str:
                 )
             elif lookup[0] == "ha_cfl":
                 score_text = await fetch_ha_cfl(lookup[2], lookup[3], scope, False)
-            else:
-                score_text = f"[{lookup[3]}] Integration paused."
+            elif lookup[0] == "hockeytech":
+                score_text = await fetch_hockeytech(
+                    lookup[2], lookup[1], lookup[3], scope, False
+                )
         else:
             score_text = f"'{league_or_team}' not mapped. Try !score help"
 
@@ -1117,6 +1790,29 @@ async def score(ctx: Context) -> str:
     except Exception:
         msg = f"@[{who}] Error fetching scores."
 
-    if len(msg) > 141:
-        msg = msg[:138] + "..."
-    return msg
+    if len(msg) <= 141:
+        return msg
+
+    split_idx = msg.rfind(" | ", 0, 141)
+    if split_idx != -1:
+        msg1 = msg[:split_idx]
+        msg2_content = msg[split_idx + 3 :].strip()
+
+        # If msg2 already has its own bracket tag or league header, carry over only the user mention
+        if msg2_content.startswith("[") or re.match(
+            r"^(?:[A-Z0-9]+|F1|UFC)(?:\s+[A-Z0-9]+)*:", msg2_content
+        ):
+            prefix = f"@[{who}] "
+        else:
+            m = re.match(r"^(@\[.*?\] (?:\[.*?\] |.*?: ))", msg1)
+            prefix = m.group(1) if m else f"@[{who}] "
+
+        msg2 = prefix + msg2_content
+
+        # Failsafe truncation if the second message still breaches 141 characters
+        if len(msg2) > 141:
+            msg2 = msg2[:138] + "..."
+
+        return f"{msg1}\n{msg2}"
+
+    return msg[:138] + "..."

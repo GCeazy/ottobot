@@ -1,132 +1,162 @@
-"""!weather — check the current conditions for Ottawa (YOW)."""
+# ==============================================================================
+# VERSION: 0.2.5
+# LINES CHANGED: ~5 lines modified
+# CHANGELOG:
+# - Incremented patch version to 0.2.5.
+# - Updated `get_coords` return signature to `tuple[str | None, str | None, str]`
+#   to resolve type-checker errors when returning `None` on failed geocoding.
+# ==============================================================================
+
+"""!weather — check the current weather conditions for Ottawa and other cities."""
 
 import urllib.request
+import urllib.parse
 import asyncio
 import re
+import json
+import time
 from ottobot import Context, command
 
-# URL for Environment Canada's location page for Ottawa
-URL = "https://weather.gc.ca/en/location/index.html?coords=45.403,-75.687"
+
+def get_coords(city: str) -> tuple[str | None, str | None, str]:
+    """Resolves a city name to lat, lon, and a short display name."""
+    clean_city = city.lower().strip()
+
+    # Fast-track Ottawa to save an API call and retain the "YOW" tag
+    if clean_city in ["ottawa", "yow", ""]:
+        return "45.403", "-75.687", "YOW"
+
+    url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(city)}&count=10&format=json"
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (Ottobot Mesh Node)"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+            if "results" in data and len(data["results"]) > 0:
+                ca_results = [
+                    r
+                    for r in data["results"]
+                    if r.get("country_code", "").upper() == "CA"
+                ]
+                res = ca_results[0] if ca_results else data["results"][0]
+
+                lat = str(round(res["latitude"], 3))
+                lon = str(round(res["longitude"], 3))
+
+                display_name = res["name"].upper()
+                if len(display_name) > 12:
+                    display_name = display_name[:12].strip()
+
+                return lat, lon, display_name
+    except Exception:
+        pass
+
+    return None, None, city[:12].upper()
 
 
-def fetch_current_weather() -> str:
-    """Fetches current weather by reliably parsing the Current Conditions section."""
+def fetch_weather_datamart(city_query: str) -> tuple[str, str]:
+    """Fetches the current observed weather from the EC location page."""
+    lat, lon, disp_name = get_coords(city_query)
+
+    if not lat:
+        return "Could not geocode location.", disp_name
+
+    url = f"https://weather.gc.ca/en/location/index.html?coords={lat},{lon}"
     req = urllib.request.Request(
-        URL, headers={"User-Agent": "Mozilla/5.0 (Ottobot Mesh Node)"}
+        url, headers={"User-Agent": "Mozilla/5.0 (Ottobot Mesh Node)"}
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            html = response.read().decode("utf-8")
+    html = ""
+    last_err = None
 
-        # Clean up the HTML tags and extra whitespace
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                html = response.read().decode("utf-8")
+                break
+        except Exception as e:
+            last_err = e
+            time.sleep(1)
+
+    if not html:
+        return f"Fetch failed after 3 attempts: {last_err}", disp_name
+
+    try:
+        # Strip HTML tags and normalize spaces
         text = re.sub(r"<[^>]+>", " ", html)
         text = re.sub(r"\s+", " ", text)
         text = text.replace("&deg;", "°")
 
-        # Isolate the Current Conditions section
-        if "Current Conditions" in text and "Forecast" in text:
-            target_text = text.split("Current Conditions")[1].split("Forecast")[0]
-        else:
-            return "Could not locate Current Conditions data."
+        # Global search: Aggressive Regex that scans the entire document
+        # completely bypassing headers and page structures.
+        temp_match = re.search(r"Temperature:\s*(-?\d+\.?\d*°?\s*C)", text)
+        cond_match = re.search(
+            r"Condition:\s*(.*?)(?=\s*Pressure:|\s*Tendency:|\s*Temperature:)", text
+        )
+        wind_match = re.search(
+            r"Wind:\s*(.*?)(?=\s*Humidex:|\s*Visibility:|\s*Date:|\s*Temperature:)",
+            text,
+        )
+        humid_match = re.search(r"Humidity:\s*(\d+\s*%)", text)
+        humidex_match = re.search(r"Humidex:\s*(\d+)", text)
+        windchill_match = re.search(r"Wind Chill:\s*(-?\d+)", text)
 
-        # Helper to find a value following a specific label
-        def extract_value(label: str) -> str:
-            # Look for the label followed by an optional colon
-            label_pattern = f"{label}:"
-            alt_label_pattern = f"{label}"
+        # Build output string only with what we found
+        out_parts = []
 
-            # Find where the label starts
-            start_idx = target_text.find(label_pattern)
-            if start_idx == -1:
-                start_idx = target_text.find(alt_label_pattern)
-                if start_idx == -1:
-                    return ""
-                # Adjust start index past the label itself
-                start_idx += len(alt_label_pattern)
-            else:
-                start_idx += len(label_pattern)
-
-            # Extract the text after the label
-            remaining_text = target_text[start_idx:].strip()
-
-            # The value usually ends before the next known label or a common delimiter
-            # We'll split by common labels to find the end of our value
-            next_labels = [
-                "Condition",
-                "Pressure",
-                "Tendency",
-                "Temperature",
-                "Dew point",
-                "Humidity",
-                "Wind",
-                "Humidex",
-                "Visibility",
-                "Date",
-                "Observed at",
-            ]
-
-            end_idx = len(remaining_text)
-            for next_label in next_labels:
-                # Don't look for the label we are currently extracting
-                if next_label != label:
-                    idx = remaining_text.find(next_label)
-                    if idx != -1 and idx < end_idx:
-                        end_idx = idx
-
-            # Return the extracted value, cleaning up any trailing colons or spaces
-            val = remaining_text[:end_idx].strip()
-            # Remove a leading colon if it was caught
-            if val.startswith(":"):
-                val = val[1:].strip()
-            return val
-
-        # Extract the specific data points
-        temp = extract_value("Temperature")
-        humidex = extract_value("Humidex")
-        cond = extract_value("Condition")
-        wind = extract_value("Wind")
-
-        # Build the final output string exactly as requested
-        msg_parts = []
-        if temp:
-            msg_parts.append(temp)
-        if humidex:
-            # Ensure only numbers are kept for the Humidex value
-            clean_humidex = re.sub(r"[^0-9]", "", humidex)
-            if clean_humidex:
-                msg_parts.append(f"Humidex: {clean_humidex}")
-        if cond:
-            # Abbreviate conditions if necessary to save space (optional, based on your previous preferences)
-            cond = (
-                cond.replace("Mainly cloudy", "Mnly Cldy")
-                .replace("Mostly Cloudy", "Mstly Cldy")
-                .replace("Partly cloudy", "Ptly Cldy")
+        if temp_match and cond_match:
+            out_parts.append(
+                f"{temp_match.group(1).strip()} {cond_match.group(1).strip()}"
             )
-            msg_parts.append(cond)
-        if wind:
-            msg_parts.append(f"Wind {wind}")
+        elif temp_match:
+            out_parts.append(f"{temp_match.group(1).strip()}")
 
-        return " | ".join(msg_parts) if msg_parts else "No weather data available."
+        if wind_match:
+            out_parts.append(f"Wnd:{wind_match.group(1).strip()}")
+
+        if humid_match:
+            out_parts.append(f"Hum:{humid_match.group(1).strip()}")
+
+        if humidex_match:
+            out_parts.append(f"Hx:{humidex_match.group(1).strip()}")
+        elif windchill_match:
+            out_parts.append(f"WC:{windchill_match.group(1).strip()}")
+
+        if out_parts:
+            out = ", ".join(out_parts)
+            # EC has a quirk where it might duplicate "Condition:" in the text
+            out = out.replace("Condition:", "").strip()
+            return out, disp_name
+        else:
+            return "Could not locate conditions block.", disp_name
 
     except Exception as e:
-        return f"Fetch failed: {e}"
+        return f"Parse failed: {e}", disp_name
 
 
-@command("weather", help="Get current Ottawa (YOW) weather conditions")
+@command("weather", help="Get the current weather conditions for a city")
 async def weather(ctx: Context) -> str:
     """The async command handler triggered by !weather."""
     who = ctx.sender_name or "you"
 
+    query_raw = (
+        "".join(str(a) for a in ctx.args).strip()
+        if hasattr(ctx, "args") and ctx.args
+        else ""
+    )
+    query = query_raw if query_raw else "Ottawa"
+
     try:
-        weather_text = await asyncio.to_thread(fetch_current_weather)
-        msg = f"@[{who}] Current YOW WX: {weather_text}"
+        weather_text, disp_name = await asyncio.to_thread(fetch_weather_datamart, query)
+        msg_prefix = f"@[{who}] {disp_name} WX"
+        single_msg = f"{msg_prefix}: {weather_text}"
 
     except Exception:
-        msg = f"@[{who}] Error fetching YOW weather."
+        return f"@[{who}] Error fetching weather for {query}."
 
-    # Enforce the strict 141-character limit for mesh radios
-    if len(msg) > 141:
-        msg = msg[:138] + "..."
+    if len(single_msg) > 141:
+        single_msg = single_msg[:138] + "..."
 
-    return msg
+    return single_msg
