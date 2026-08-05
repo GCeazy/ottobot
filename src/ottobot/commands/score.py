@@ -1,11 +1,22 @@
 # ==============================================================================
-# VERSION: 0.5.21
-# LINES CHANGED: ~15 lines modified
+# VERSION: 0.5.26
+# LINES CHANGED: ~35 lines modified
 # CHANGELOG:
-# - Incremented patch version to 0.5.21.
-# - Simplified prefix logic in `fetch_city_slate` to cleanly output `YOW: ` or
-#   `Toronto: ` on default queries, removing the confusing `Today:` and `Sports:`
-#   labels while retaining the 7-day lookup functionality.
+# - Incremented patch version to 0.5.26.
+# - Updated "No upcoming games scheduled" strings across all fetchers to
+#   dynamically inject the `max_days` parameter. The bot will now explicitly
+#   state "No games in next 30 days" (or 7 days, or 365 days) to provide
+#   transparency on the exact API search window.
+# - Cleaned up `fetch_city_slate` and `fetch_gceazy_slate` compression
+#   filters to catch the new string format.
+#
+# *** DEPLOYMENT NOTE FOR BOT HOSTS ***
+# This module requires the `curl-cffi` package to bypass WAF blocks (403 errors)
+# on the ESPN APIs. If the bot crashes on startup with:
+# "ModuleNotFoundError: No module named 'curl_cffi'"
+# You must update the host environment to install the new dependency:
+# - If running locally via uv: Run `uv sync`
+# - If running via Docker: Run `docker compose up -d --build`
 # ==============================================================================
 
 """!score — get live sports scores and game slates via real-time APIs."""
@@ -19,6 +30,10 @@ import re
 from datetime import datetime, timedelta, date
 from typing import TypedDict
 from ottobot import Context, command
+
+# Required for TLS fingerprint spoofing to bypass ESPN API 403 Forbidden blocks.
+# Host must run `uv sync` or rebuild Docker to install this dependency.
+from curl_cffi import requests as cffi_requests
 
 
 class CFLEvent(TypedDict):
@@ -566,7 +581,7 @@ async def fetch_hockeytech(
     league_label: str,
     scope: str = "default",
     return_raw: bool = False,
-    max_days: int = 7,
+    max_days: int = 365,
 ) -> str:
     """Directly queries the HockeyTech modulekit feeds for CHL live timekeeper integration."""
     is_next_query = scope in ["next", "tomorrow"] or (
@@ -583,7 +598,11 @@ async def fetch_hockeytech(
 
     try:
         req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Encoding": "gzip",
+            },
         )
         resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
         raw_data = resp.read()
@@ -716,7 +735,7 @@ async def fetch_hockeytech(
         elif scope == "yesterday":
             return f"{'['+league_label+']' if search_team else league_label+':'} No games scheduled {yest_date.month}/{yest_date.day}{' for '+subj if search_team else ''}."
         else:
-            return f"{'['+league_label+']' if search_team else league_label+':'} No upcoming games{' for '+subj if search_team else ''}."
+            return f"{'['+league_label+']' if search_team else league_label+':'} No games in next {max_days} days{' for '+subj if search_team else ''}."
 
     def ht_priority(evt):
         tiers = PRIORITY_TEAMS.get(client_code.lower(), [])
@@ -773,14 +792,19 @@ async def fetch_ha_cfl(
     league_label: str,
     scope: str = "default",
     return_raw: bool = False,
-    max_days: int = 7,
+    max_days: int = 365,
 ) -> str:
     """Dynamically parses the live CFL scoreboard JSON payload."""
     url = "https://cflscoreboard.cfl.ca/json/scoreboard/rounds.json"
 
     try:
         req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+            },
         )
         resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
         raw_data = resp.read()
@@ -905,7 +929,7 @@ async def fetch_ha_cfl(
         elif scope == "yesterday":
             return f"{'['+league_label+']' if search_team else league_label+':'} No games scheduled {yest.month}/{yest.day}{' for '+subj if search_team else ''}."
         else:
-            return f"{'['+league_label+']' if search_team else league_label+':'} No upcoming games{' for '+subj if search_team else ''}."
+            return f"{'['+league_label+']' if search_team else league_label+':'} No games in next {max_days} days{' for '+subj if search_team else ''}."
 
     pairs = []
     for e in matches:
@@ -1019,7 +1043,7 @@ def format_event(event: dict, team_query: str = "", scope: str = "") -> str:
         return ""
 
 
-def fetch_ufc_slate(scope: str = "default", max_days: int = 7) -> str:
+def fetch_ufc_slate(scope: str = "default", max_days: int = 30) -> str:
     """Fetches UFC events and formats individual fights. Reverses fight list to ensure Main Events print first."""
     now = datetime.now()
     today_date = now.date()
@@ -1037,20 +1061,17 @@ def fetch_ufc_slate(scope: str = "default", max_days: int = 7) -> str:
         date_param = f"&dates={today_date.strftime('%Y%m%d')}"
         slate_date_str = f"{today_date.month}/{today_date.day}"
     else:  # next
-        date_param = f"&dates={today_date.strftime('%Y%m%d')}-{(today_date + timedelta(days=30)).strftime('%Y%m%d')}"
+        date_param = f"&dates={today_date.strftime('%Y%m%d')}-{(today_date + timedelta(days=max_days)).strftime('%Y%m%d')}"
         slate_date_str = f"{today_date.month}/{today_date.day}"
 
     url = f"https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard?limit=200{date_param}"
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
-    )
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            raw_data = response.read()
-            if response.info().get("Content-Encoding") == "gzip":
-                raw_data = gzip.decompress(raw_data)
-            data = json.loads(raw_data.decode("utf-8"))
+        response = cffi_requests.get(url, impersonate="chrome110", timeout=10)
+        if response.status_code == 403:
+            return "UFC: Fetch failed (403 Forbidden)"
+        response.raise_for_status()
+        data = response.json()
 
         events = data.get("events", [])
 
@@ -1059,7 +1080,7 @@ def fetch_ufc_slate(scope: str = "default", max_days: int = 7) -> str:
                 return "UFC LIVE: No live events."
             elif scope in ["yesterday", "tomorrow"]:
                 return f"UFC: No events {scope}."
-            return f"UFC: No events scheduled on {slate_date_str}."
+            return f"UFC: No events in next {max_days} days."
 
         events.sort(key=lambda x: x.get("date", ""))
 
@@ -1079,8 +1100,8 @@ def fetch_ufc_slate(scope: str = "default", max_days: int = 7) -> str:
                         name = e.get("shortName", e.get("name", "UFC Event"))
                         return f"UFC NEXT: {name} ({dt.month}/{dt.day})"
                     else:
-                        return "UFC: No events found."
-            return "UFC NEXT: No upcoming events scheduled."
+                        return f"UFC: No events in next {max_days} days."
+            return f"UFC NEXT: No events in next {max_days} days."
 
         target_events = []
         for e in events:
@@ -1163,21 +1184,18 @@ def fetch_ufc_slate(scope: str = "default", max_days: int = 7) -> str:
         return f"Fetch failed: {e}"
 
 
-def fetch_f1_slate(scope: str = "default", max_days: int = 7) -> str:
+def fetch_f1_slate(scope: str = "default", max_days: int = 365) -> str:
     url = "https://site.api.espn.com/apis/site/v2/sports/racing/f1/scoreboard"
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
-    )
     now = datetime.now()
     today_date = now.date()
     cutoff_date = today_date + timedelta(days=max_days)
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            raw_data = response.read()
-            if response.info().get("Content-Encoding") == "gzip":
-                raw_data = gzip.decompress(raw_data)
-            data = json.loads(raw_data.decode("utf-8"))
+        response = cffi_requests.get(url, impersonate="chrome110", timeout=10)
+        if response.status_code == 403:
+            return "F1: Fetch failed (403 Forbidden)"
+        response.raise_for_status()
+        data = response.json()
 
         events = data.get("events", [])
         if not events:
@@ -1217,14 +1235,18 @@ def fetch_f1_slate(scope: str = "default", max_days: int = 7) -> str:
                     name = e.get("shortName", e.get("name", "Race"))
                     return f"F1 NEXT: {name} ({dt.month}/{dt.day})"
                 else:
-                    return "F1: No events found."
-        return "F1: No live or upcoming races."
+                    return f"F1: No events in next {max_days} days."
+        return f"F1: No events in next {max_days} days."
     except Exception as e:
         return f"Fetch failed: {e}"
 
 
 def fetch_espn_league_slate(
-    sport: str, league: str, display_name: str, scope: str = "default"
+    sport: str,
+    league: str,
+    display_name: str,
+    scope: str = "default",
+    max_days: int = 30,
 ) -> str:
     now = datetime.now()
     today_date = now.date()
@@ -1241,20 +1263,17 @@ def fetch_espn_league_slate(
         date_param = f"&dates={today_date.strftime('%Y%m%d')}"
         slate_date_str = f"{today_date.month}/{today_date.day}"
     else:  # default league queries ("today") or "next"
-        date_param = f"&dates={today_date.strftime('%Y%m%d')}-{(today_date + timedelta(days=30)).strftime('%Y%m%d')}"
+        date_param = f"&dates={today_date.strftime('%Y%m%d')}-{(today_date + timedelta(days=max_days)).strftime('%Y%m%d')}"
         slate_date_str = f"{today_date.month}/{today_date.day}"
 
     url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard?limit=200{date_param}"
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
-    )
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            raw_data = response.read()
-            if response.info().get("Content-Encoding") == "gzip":
-                raw_data = gzip.decompress(raw_data)
-            data = json.loads(raw_data.decode("utf-8"))
+        response = cffi_requests.get(url, impersonate="chrome110", timeout=10)
+        if response.status_code == 403:
+            return f"{display_name}: Fetch failed (403 Forbidden)"
+        response.raise_for_status()
+        data = response.json()
 
         events = data.get("events", [])
 
@@ -1263,7 +1282,7 @@ def fetch_espn_league_slate(
                 return f"{display_name}: No live games."
             if scope in ["default", "today"]:
                 return f"{display_name}: No games scheduled {today_date.month}/{today_date.day}."
-            return f"{display_name}: No games {scope}."
+            return f"{display_name}: No games in next {max_days} days."
 
         events.sort(key=lambda x: (get_event_priority(x, league), x.get("date", "")))
 
@@ -1279,7 +1298,7 @@ def fetch_espn_league_slate(
                 == "pre"
             ]
             if not pre_events:
-                return f"{display_name}: No upcoming games scheduled."
+                return f"{display_name}: No games in next {max_days} days."
 
             first_date = get_local_date(pre_events[0].get("date", ""))
             next_slate = [
@@ -1318,7 +1337,7 @@ def fetch_espn_league_slate(
                 return f"{display_name}: No live games."
             if scope in ["default", "today"]:
                 return f"{display_name}: No games scheduled {today_date.month}/{today_date.day}."
-            return f"{display_name}: No games {scope}."
+            return f"{display_name}: No games in next {max_days} days."
 
         prefix_scope = (
             f"{display_name} LIVE: "
@@ -1332,7 +1351,7 @@ def fetch_espn_league_slate(
                 return f"{display_name}: No live games."
             if scope in ["default", "today"]:
                 return f"{display_name}: No games scheduled {today_date.month}/{today_date.day}."
-            return f"{display_name}: No upcoming games scheduled."
+            return f"{display_name}: No games in next {max_days} days."
         return f"Fetch failed: {e}"
 
 
@@ -1344,7 +1363,7 @@ def fetch_espn_team(
     team_query: str,
     scope: str = "default",
     return_raw=False,
-    max_days: int = 7,
+    max_days: int = 30,
 ) -> str:
     now = datetime.now()
     today_date = now.date()
@@ -1359,7 +1378,7 @@ def fetch_espn_team(
     elif scope in ["today", "live"]:
         date_param = f"&dates={today_date.strftime('%Y%m%d')}"
     else:
-        date_param = f"&dates={today_date.strftime('%Y%m%d')}-{(today_date + timedelta(days=30)).strftime('%Y%m%d')}"
+        date_param = f"&dates={today_date.strftime('%Y%m%d')}-{(today_date + timedelta(days=max_days)).strftime('%Y%m%d')}"
 
     leagues = league_input.split(",")
     all_raw_events = []
@@ -1367,17 +1386,16 @@ def fetch_espn_team(
     # Check multiple leagues if provided (e.g., cross-competition or relegations)
     for l_id in leagues:
         url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{l_id}/scoreboard?limit=1000{date_param}"
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
-        )
         try:
-            with urllib.request.urlopen(req, timeout=10) as response:
-                raw_data = response.read()
-                if response.info().get("Content-Encoding") == "gzip":
-                    raw_data = gzip.decompress(raw_data)
-                events = json.loads(raw_data.decode("utf-8")).get("events", [])
-                all_raw_events.extend(events)
-        except:
+            response = cffi_requests.get(url, impersonate="chrome110", timeout=10)
+            if response.status_code == 403:
+                if return_raw:
+                    return f"[{league_label}] {search_name.title()}: API 403 Forbidden"
+                return f"[{league_label}] Fetch failed: HTTP Error 403: Forbidden"
+            response.raise_for_status()
+            events = response.json().get("events", [])
+            all_raw_events.extend(events)
+        except Exception as e:
             continue
 
     team_events = []
@@ -1425,9 +1443,7 @@ def fetch_espn_team(
             return f"[{league_label}] No games scheduled {tom_date.month}/{tom_date.day} for {search_name.title()}."
         elif scope == "yesterday":
             return f"[{league_label}] No games scheduled {yest_date.month}/{yest_date.day} for {search_name.title()}."
-        return (
-            f"[{league_label}] No upcoming games scheduled for {search_name.title()}."
-        )
+        return f"[{league_label}] No games in next {max_days} days for {search_name.title()}."
 
     team_events.sort(key=lambda x: x.get("date", ""))
 
@@ -1463,9 +1479,7 @@ def fetch_espn_team(
                     return f"[{league_label}] " + fmt
         if return_raw:
             return ""
-        return (
-            f"[{league_label}] No upcoming games scheduled for {search_name.title()}."
-        )
+        return f"[{league_label}] No games in next {max_days} days for {search_name.title()}."
 
     msg_parts = []
 
@@ -1528,7 +1542,9 @@ def fetch_espn_team(
         return f"[{league_label}] No games scheduled {tom_date.month}/{tom_date.day} for {search_name.title()}."
     elif scope == "yesterday":
         return f"[{league_label}] No games scheduled {yest_date.month}/{yest_date.day} for {search_name.title()}."
-    return f"[{league_label}] No upcoming games scheduled for {search_name.title()}."
+    return (
+        f"[{league_label}] No games in next {max_days} days for {search_name.title()}."
+    )
 
 
 async def fetch_city_slate(city_query: str, scope: str) -> str:
@@ -1568,8 +1584,8 @@ async def fetch_city_slate(city_query: str, scope: str) -> str:
             if (
                 res
                 and "No games" not in res
-                and "No upcoming" not in res
                 and "No live" not in res
+                and "No events" not in res
             ):
                 results.append(res)
         except:
@@ -1646,12 +1662,7 @@ async def fetch_gceazy_slate(scope: str) -> str:
     # 4. F1
     try:
         f1_res = await asyncio.to_thread(fetch_f1_slate, scope, 7)
-        if (
-            f1_res
-            and "No events" not in f1_res
-            and "No upcoming" not in f1_res
-            and "No live" not in f1_res
-        ):
+        if f1_res and "No events" not in f1_res and "No live" not in f1_res:
             results.append(f1_res)
     except:
         pass
@@ -1677,12 +1688,7 @@ async def fetch_gceazy_slate(scope: str) -> str:
     # 6. UFC
     try:
         ufc_res = await asyncio.to_thread(fetch_ufc_slate, scope, 7)
-        if (
-            ufc_res
-            and "No events" not in ufc_res
-            and "No upcoming" not in ufc_res
-            and "No live" not in ufc_res
-        ):
+        if ufc_res and "No events" not in ufc_res and "No live" not in ufc_res:
             results.append(ufc_res)
     except:
         pass
@@ -1708,7 +1714,30 @@ async def fetch_gceazy_slate(scope: str) -> str:
     if not results:
         return "No events in next 7 days."
 
-    return " | ".join(results)
+    # Compress empty API search boundaries to preserve screen real estate
+    compressed_results = []
+    for res in results:
+        if (
+            "No games in next" in res
+            or "No games scheduled" in res
+            or "No live games" in res
+            or "No events in next" in res
+        ):
+            # Extract league tag and team name using simple regex or fallback logic
+            m = re.match(
+                r"^\[(.*?)\] (?:No games in next \d+ days for )?(.*?):? (.*)$", res
+            )
+            if m:
+                league_tag = m.group(1)
+                team_name = m.group(2).strip()
+                res = f"[{league_tag}] {team_name}: No games"
+            elif "F1:" in res:
+                res = "F1: No events"
+            elif "UFC:" in res:
+                res = "UFC: No events"
+        compressed_results.append(res)
+
+    return " | ".join(compressed_results)
 
 
 @command("score", help="Get sports scores or live slates")
