@@ -1,11 +1,10 @@
 # ==============================================================================
-# VERSION: 0.0.3
+# VERSION: 0.0.4
 # CHANGELOG: 
-# - Incremented patch version to 0.0.3.
-# - Implemented a hybrid layout to respect the 141-character MeshCore limit. 
-#   The dealer's hand is now rendered inline (e.g., [8♦][??]), while the player 
-#   retains the graphical 3-line ASCII cards.
-# - Shortened instructional prompts to save space (e.g., '!blackjack h/s').
+# - Incremented patch version to 0.0.4.
+# - Implemented the "UI Divider" layout to visually isolate the dealer's inline 
+#   cards from the player's ASCII cards.
+# - Added spacing to the dealer's inline cards for better readability.
 # ==============================================================================
 
 """!blackjack — Play a hand of Blackjack against Ottobot."""
@@ -42,13 +41,14 @@ def calculate_score(hand):
 
 def draw_inline_hand(hand, hide_second=False):
     """Generates an ultra-compact inline string for the dealer's hand."""
-    res = ""
+    res = []
     for i, (v, s) in enumerate(hand):
         if hide_second and i == 1:
-            res += "[??]"
+            res.append("[ ?? ]")
         else:
-            res += f"[{v}{s}]"
-    return res
+            val_str = f"{v}{s}" if v == '10' else f"{v} {s}"
+            res.append(f"[ {val_str} ]")
+    return "  ".join(res)
 
 def draw_ascii_hand(hand):
     """Generates a compact 3-line ASCII representation of a hand."""
@@ -104,8 +104,10 @@ async def blackjack(ctx: Context) -> str:
         p_ascii = draw_ascii_hand(player_hand)
         d_inline = draw_inline_hand(dealer_hand, hide_second=True)
         
-        return (f"@[{who}] Dlr: {d_inline}\n"
-                f"You ({p_score}):\n{p_ascii}\n"
+        return (f"@[{who}] DEALER:\n"
+                f"{d_inline}\n"
+                f"═════════════════\n"
+                f"YOU ({p_score}):\n{p_ascii}\n"
                 f"!blackjack h/s")
 
     # Intercept commands if they don't have a game running
@@ -125,15 +127,25 @@ async def blackjack(ctx: Context) -> str:
         if p_score > 21:
             del ACTIVE_GAMES[who]
             p_ascii = draw_ascii_hand(player_hand)
-            return f"@[{who}] BUST! You lose.\n{p_ascii}\nScore: {p_score}"
+            d_inline = draw_inline_hand(dealer_hand, hide_second=False)
+            d_score = calculate_score(dealer_hand)
+            
+            return (f"@[{who}] DEALER ({d_score}):\n"
+                    f"{d_inline}\n"
+                    f"═════════════════\n"
+                    f"YOU ({p_score}):\n{p_ascii}\n"
+                    f"BUST! You lose.")
+                    
         elif p_score == 21:
             # Auto-stand them if they hit exactly 21 to save them a radio transmission
             action = "stand"
         else:
             p_ascii = draw_ascii_hand(player_hand)
             d_inline = draw_inline_hand(dealer_hand, hide_second=True)
-            return (f"@[{who}] Dlr: {d_inline}\n"
-                    f"You ({p_score}):\n{p_ascii}\n"
+            return (f"@[{who}] DEALER:\n"
+                    f"{d_inline}\n"
+                    f"═════════════════\n"
+                    f"YOU ({p_score}):\n{p_ascii}\n"
                     f"!blackjack h/s")
 
     # Handle 'Stand'
@@ -152,7 +164,10 @@ async def blackjack(ctx: Context) -> str:
         p_ascii = draw_ascii_hand(player_hand)
         d_inline = draw_inline_hand(dealer_hand, hide_second=False)
         
-        msg = f"@[{who}] Dlr ({d_score}): {d_inline}\nYou ({p_score}):\n{p_ascii}\n"
+        msg = (f"@[{who}] DEALER ({d_score}):\n"
+               f"{d_inline}\n"
+               f"═════════════════\n"
+               f"YOU ({p_score}):\n{p_ascii}\n")
         
         if d_score > 21:
             msg += "Dealer BUSTS! You WIN! 🎉"
