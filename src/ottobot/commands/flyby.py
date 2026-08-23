@@ -6,7 +6,7 @@ Version: 0.1
 Changelog:
 - v0.1: Initial release. Added ADSB.lol integration, 140-character mesh
         truncation safeguard, filtered out grounded aircraft, compass headings,
-        operator identification, rich aircraft descriptions, and 
+        operator identification, rich aircraft descriptions, and
         comprehensive Ottawa region dictionary.
 """
 
@@ -84,7 +84,10 @@ async def flyby(ctx: Context) -> str:
 
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, timeout=5) as response:
+            # Fixed the timeout syntax for the strict static type checker
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
                 if response.status != 200:
                     return "Error: Could not reach flight data API."
                 data = await response.json()
@@ -130,7 +133,7 @@ async def flyby(ctx: Context) -> str:
     results = []
     for ac in visible[:2]:
         flight = str(ac.get("flight") or ac.get("r") or "").strip()
-        
+
         # 1. Identify Operator or fallback to Registration/Callsign
         operator = flight
         if len(flight) >= 3 and flight[:3].upper() in OPERATORS:
