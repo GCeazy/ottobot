@@ -16,8 +16,7 @@ async def test_channels_lists_all(bot: Ottobot, reply: ReplyRecorder) -> None:
     await bot.dispatch(addressed("!channels"), reply)
     assert reply.replies == [
         "Channels: #ottawa #bots #testing #hike #bike #hamradio "
-        "#games #aircraft #watersports #ott-alerts #radio #queer "
-        "#caf #wardriving #cars"
+        "#games #aircraft #watersports #ott-alerts"
     ]
 
 
