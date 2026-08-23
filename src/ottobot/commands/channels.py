@@ -29,16 +29,9 @@ CHANNELS = (
 
 
 @command("channels", help="List Ottawa's public MeshCore channels")
-async def channels(ctx: Context) -> list[str]:
-    # Find the midpoint of the tuple to split the list evenly
+async def channels(ctx: Context) -> str:
     half_index = len(CHANNELS) // 2
-    
-    # Join each half into its own space-separated string
     page_1 = " ".join(CHANNELS[:half_index])
     page_2 = " ".join(CHANNELS[half_index:])
     
-    # Return a list of strings; the framework will send them sequentially
-    return [
-        f"Channels (1/2): {page_1}",
-        f"Channels (2/2): {page_2}"
-    ]
+    return f"Channels (1/2): {page_1}\nChannels (2/2): {page_2}"
